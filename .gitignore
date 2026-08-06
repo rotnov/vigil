@@ -1,0 +1,11 @@
+/target
+
+# Python agent
+agent/.venv
+**/__pycache__
+*.pyc
+agent/*.egg-info
+
+# vigil runtime output
+*.jsonl
+.DS_Store
