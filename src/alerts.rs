@@ -5,7 +5,7 @@
 //! it never takes any corrective action itself. Any actual fix requires a
 //! separate, explicit user confirmation outside this tool.
 
-use crate::Snapshot;
+use crate::{ProcGroup, ProcInfo, Snapshot};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,11 @@ const RECENT_ALERTS_CAPACITY: usize = 10;
 /// tune both from real field data the way the other rules' thresholds were.
 const HIGH_CONNECTION_COUNT_THRESHOLD: u32 = 1500;
 const INCOMING_CONNECTIONS_THRESHOLD: u32 = 10;
+/// How much bigger a process group's combined memory needs to be than the
+/// single top consumer's before a message cites the group instead — avoids
+/// e.g. citing "2 × app (210 MB combined)" when the single top process
+/// already dominates and the group framing would just be noise.
+const GROUP_VS_SINGLE_RATIO: f64 = 1.5;
 
 /// A short rolling log of every alert that fired recently (any key,
 /// including ones that never trigger an agent diagnosis on their own —
@@ -165,6 +170,26 @@ impl AlertState {
     }
 }
 
+/// Describes the memory consumer worth naming in a message: the single top
+/// process, unless a process *group* (see `crate::group_by_name`) is
+/// materially larger — e.g. a dozen renderer helpers that individually
+/// never rank at the top but collectively dwarf it. See
+/// `GROUP_VS_SINGLE_RATIO` and the `AGENTS.md`/task history around process
+/// grouping for why this exists.
+fn format_mem_consumer(single: &ProcInfo, groups: &[ProcGroup]) -> String {
+    if let Some(top_group) = groups.first() {
+        if top_group.count > 1 && top_group.total_mem_bytes as f64 >= single.mem_bytes as f64 * GROUP_VS_SINGLE_RATIO {
+            return format!(
+                "{}× {} processes ({:.0} MB combined)",
+                top_group.count,
+                top_group.name,
+                top_group.total_mem_bytes as f64 / 1e6
+            );
+        }
+    }
+    format!("{} ({:.0} MB)", single.name, single.mem_bytes as f64 / 1e6)
+}
+
 /// Evaluate a snapshot against fixed heuristics and return any alerts that
 /// are due (i.e. not suppressed by their per-rule cooldown).
 pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, cooldown: Duration, now: Instant) -> Vec<Alert> {
@@ -196,10 +221,9 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                 "swap_pressure",
                 "vigil: active swap",
                 format!(
-                    "Swap usage {:.1} GB — memory is running out. Top consumer: {} ({:.0} MB). Suggestion: close it or restart the machine.",
+                    "Swap usage {:.1} GB — memory is running out. Top consumer: {}. Suggestion: close it or restart the machine.",
                     snap.memory.swap_used_bytes as f64 / 1e9,
-                    top.name,
-                    top.mem_bytes as f64 / 1e6
+                    format_mem_consumer(top, &snap.top_mem_groups)
                 ),
                 Some(&top.name),
                 &mut alerts,
@@ -217,10 +241,9 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     "low_memory",
                     "vigil: low free memory",
                     format!(
-                        "Only {:.1}% memory free. Top consumer: {} ({:.0} MB). Suggestion: close unused applications.",
+                        "Only {:.1}% memory free. Top consumer: {}. Suggestion: close unused applications.",
                         free_ratio * 100.0,
-                        top.name,
-                        top.mem_bytes as f64 / 1e6
+                        format_mem_consumer(top, &snap.top_mem_groups)
                     ),
                     Some(&top.name),
                     &mut alerts,
@@ -387,7 +410,7 @@ fn osa_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConnectionCounts, DiskInfo, LoadAvg, MemoryInfo, ProcInfo, Snapshot};
+    use crate::{ConnectionCounts, DiskInfo, LoadAvg, MemoryInfo, ProcGroup, ProcInfo, Snapshot};
 
     fn proc(pid: u32, name: &str, cpu_pct: f32, mem_mb: u64) -> ProcInfo {
         ProcInfo {
@@ -421,6 +444,7 @@ mod tests {
             connections: None,
             top_cpu: vec![proc(1, "idle_app", 5.0, 100)],
             top_mem: vec![proc(1, "idle_app", 5.0, 100)],
+            top_mem_groups: vec![],
         }
     }
 
@@ -488,6 +512,68 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].key, "swap_pressure");
         assert!(alerts[0].message.contains("leaky"));
+    }
+
+    #[test]
+    fn swap_pressure_cites_process_group_when_materially_larger_than_single_top() {
+        let mut snap = healthy_snapshot();
+        snap.memory.swap_used_bytes = 3 * 1024 * 1024 * 1024;
+        snap.top_mem = vec![proc(7, "pycharm", 2.0, 4000)]; // 4000 MB single top
+        snap.top_mem_groups = vec![ProcGroup {
+            name: "Renderer Helper".to_string(),
+            count: 12,
+            total_cpu_pct: 6.0,
+            total_mem_bytes: 8_000_000_000, // 2x the single top -- over GROUP_VS_SINGLE_RATIO
+            top_pid: 42,
+        }];
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("12"), "should cite the group's process count");
+        assert!(alerts[0].message.contains("Renderer Helper"));
+        assert!(!alerts[0].message.contains("pycharm"), "the dwarfed single process shouldn't be cited instead");
+    }
+
+    #[test]
+    fn swap_pressure_ignores_group_when_not_materially_larger_than_single_top() {
+        let mut snap = healthy_snapshot();
+        snap.memory.swap_used_bytes = 3 * 1024 * 1024 * 1024;
+        snap.top_mem = vec![proc(7, "pycharm", 2.0, 19000)]; // 19000 MB single top
+        snap.top_mem_groups = vec![ProcGroup {
+            name: "Renderer Helper".to_string(),
+            count: 3,
+            total_cpu_pct: 2.0,
+            total_mem_bytes: 600_000_000, // well under the single top -- no reason to prefer it
+            top_pid: 42,
+        }];
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("pycharm"));
+        assert!(!alerts[0].message.contains("Renderer Helper"));
+    }
+
+    #[test]
+    fn low_memory_cites_process_group_when_materially_larger() {
+        let mut snap = healthy_snapshot();
+        snap.memory.free_bytes = 100_000_000; // 0.625% of 16GB total -- under LOW_FREE_MEM_RATIO
+        snap.top_mem = vec![proc(7, "pycharm", 2.0, 3000)];
+        snap.top_mem_groups = vec![ProcGroup {
+            name: "node".to_string(),
+            count: 20,
+            total_cpu_pct: 10.0,
+            total_mem_bytes: 6_000_000_000,
+            top_pid: 99,
+        }];
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].key, "low_memory");
+        assert!(alerts[0].message.contains("20"));
+        assert!(alerts[0].message.contains("node"));
     }
 
     #[test]

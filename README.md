@@ -19,7 +19,10 @@ without you doing it yourself.
 - `vigil watch` — continuously appends snapshots to JSONL + fires native macOS
   notifications on detected anomalies (high load average, active swap, a process
   holding CPU for several consecutive samples, low disk space, low battery, an
-  unusually high TCP connection count, or unusual incoming connections)
+  unusually high TCP connection count, or unusual incoming connections). Swap/
+  memory alerts name whichever is bigger — the single top process, or a process
+  *group* (every same-named instance combined, e.g. a dozen renderer helpers that
+  individually never rank at the top) when the group is at least 1.5x larger
 - `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes,
   battery % with a drain-rate ETA when discharging), `a` key — ask the agent a
   question right from the interface

@@ -133,6 +133,26 @@ struct Snapshot {
     connections: Option<ConnectionCounts>,
     top_cpu: Vec<ProcInfo>,
     top_mem: Vec<ProcInfo>,
+    /// Processes aggregated by name (e.g. every "Google Chrome Helper
+    /// (Renderer)" instance combined), sorted by combined memory
+    /// descending. Individually small helper/renderer processes of a
+    /// multi-process app can each sit well below `top_mem`'s per-process
+    /// ranking while their *sum* is the real memory story — this is how
+    /// `swap_pressure`/`low_memory` notice that case. See
+    /// `group_by_name`/`alerts::format_mem_consumer`.
+    top_mem_groups: Vec<ProcGroup>,
+}
+
+#[derive(Serialize, Clone)]
+struct ProcGroup {
+    name: String,
+    count: u32,
+    total_cpu_pct: f32,
+    total_mem_bytes: u64,
+    /// The single highest-memory PID in this group — a pointer for further
+    /// investigation (e.g. `sample <pid>`), not a claim that it alone
+    /// explains the group's total.
+    top_pid: u32,
 }
 
 #[derive(Serialize, Clone)]
@@ -215,6 +235,13 @@ fn take_snapshot(sys: &mut System, top_n: usize) -> Snapshot {
         .map(|(pid, p)| to_proc_info(pid, p))
         .collect();
 
+    // Over ALL processes, not just top_n — a process that individually
+    // never ranks in top_mem can still be part of a group whose combined
+    // memory does.
+    let all_procs: Vec<ProcInfo> = procs.iter().map(|(pid, p)| to_proc_info(pid, p)).collect();
+    let mut top_mem_groups = group_by_name(&all_procs);
+    top_mem_groups.truncate(top_n);
+
     Snapshot {
         ts_unix: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -237,7 +264,53 @@ fn take_snapshot(sys: &mut System, top_n: usize) -> Snapshot {
         connections: collect_connections(),
         top_cpu,
         top_mem,
+        top_mem_groups,
     }
+}
+
+/// Aggregates by process name — every "Google Chrome Helper (Renderer)"
+/// instance combined, etc. — sorted by combined memory descending. A pure
+/// function over `ProcInfo`s (not `sysinfo::Process`) so it's testable
+/// without a real `System`.
+fn group_by_name(procs: &[ProcInfo]) -> Vec<ProcGroup> {
+    struct Acc {
+        count: u32,
+        total_cpu_pct: f32,
+        total_mem_bytes: u64,
+        top_pid: u32,
+        top_pid_mem: u64,
+    }
+
+    let mut groups: std::collections::HashMap<&str, Acc> = std::collections::HashMap::new();
+    for p in procs {
+        let acc = groups.entry(p.name.as_str()).or_insert(Acc {
+            count: 0,
+            total_cpu_pct: 0.0,
+            total_mem_bytes: 0,
+            top_pid: p.pid,
+            top_pid_mem: 0,
+        });
+        acc.count += 1;
+        acc.total_cpu_pct += p.cpu_pct;
+        acc.total_mem_bytes += p.mem_bytes;
+        if p.mem_bytes > acc.top_pid_mem {
+            acc.top_pid_mem = p.mem_bytes;
+            acc.top_pid = p.pid;
+        }
+    }
+
+    let mut result: Vec<ProcGroup> = groups
+        .into_iter()
+        .map(|(name, acc)| ProcGroup {
+            name: name.to_string(),
+            count: acc.count,
+            total_cpu_pct: acc.total_cpu_pct,
+            total_mem_bytes: acc.total_mem_bytes,
+            top_pid: acc.top_pid,
+        })
+        .collect();
+    result.sort_by(|a, b| b.total_mem_bytes.cmp(&a.total_mem_bytes));
+    result
 }
 
 fn collect_disks() -> Vec<DiskInfo> {
@@ -581,6 +654,53 @@ fn run_incidents_command(dir: &str, show: Option<&str>, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proc(pid: u32, name: &str, cpu_pct: f32, mem_bytes: u64) -> ProcInfo {
+        ProcInfo { pid, name: name.to_string(), cpu_pct, mem_bytes, run_time_secs: 0, cmd: name.to_string() }
+    }
+
+    #[test]
+    fn group_by_name_aggregates_multiple_instances() {
+        let procs = vec![
+            proc(1, "Google Chrome Helper (Renderer)", 5.0, 200_000_000),
+            proc(2, "Google Chrome Helper (Renderer)", 3.0, 250_000_000),
+            proc(3, "Google Chrome Helper (Renderer)", 4.0, 180_000_000),
+            proc(4, "pycharm", 90.0, 19_000_000_000),
+        ];
+        let groups = group_by_name(&procs);
+
+        let chrome = groups.iter().find(|g| g.name == "Google Chrome Helper (Renderer)").unwrap();
+        assert_eq!(chrome.count, 3);
+        assert_eq!(chrome.total_mem_bytes, 200_000_000 + 250_000_000 + 180_000_000);
+        assert!((chrome.total_cpu_pct - 12.0).abs() < 0.01);
+        assert_eq!(chrome.top_pid, 2, "the highest-memory instance in the group");
+
+        let pycharm = groups.iter().find(|g| g.name == "pycharm").unwrap();
+        assert_eq!(pycharm.count, 1);
+        assert_eq!(pycharm.total_mem_bytes, 19_000_000_000);
+    }
+
+    #[test]
+    fn group_by_name_sorts_by_combined_memory_descending() {
+        let procs = vec![
+            proc(1, "solo-big", 1.0, 4_000_000_000),
+            proc(2, "helper", 1.0, 1_500_000_000),
+            proc(3, "helper", 1.0, 1_500_000_000),
+            proc(4, "helper", 1.0, 1_500_000_000),
+        ];
+        let groups = group_by_name(&procs);
+        // Combined, "helper" (3 x 1.5GB = 4.5GB) edges out "solo-big"
+        // (4GB) even though no single "helper" instance comes close --
+        // this is the whole point of grouping.
+        assert_eq!(groups[0].name, "helper");
+        assert_eq!(groups[0].total_mem_bytes, 4_500_000_000);
+        assert_eq!(groups[1].name, "solo-big");
+    }
+
+    #[test]
+    fn group_by_name_handles_empty_input() {
+        assert!(group_by_name(&[]).is_empty());
+    }
 
     #[test]
     fn parses_discharging_battery_line() {
