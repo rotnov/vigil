@@ -386,6 +386,13 @@ pub fn evaluate_battery(
 /// Fire a native macOS notification. Purely informational — never runs any
 /// remediation itself. The user acts on the suggestion manually (or, in a
 /// future agent-driven mode, only after explicit confirmation).
+///
+/// Coverage exemption (see AGENTS.md's testing section): calling this in a
+/// unit test would pop a real, visible notification on the maintainer's own
+/// Mac on every `cargo test` run — the `Command`/`osascript` call itself is
+/// the entire function body, with nothing left to meaningfully unit-test
+/// once `osa_quote` (the part that actually has logic) is covered on its
+/// own, which it is below.
 pub fn notify(alert: &Alert) {
     let script = format!(
         "display notification {} with title {} sound name \"Glass\"",
@@ -460,6 +467,19 @@ mod tests {
     fn osa_quote_still_escapes_quotes_and_backslashes() {
         let quoted = osa_quote(r#"she said "hi" \ ok"#);
         assert_eq!(quoted, r#""she said \"hi\" \\ ok""#);
+    }
+
+    #[test]
+    fn zero_total_memory_does_not_panic_or_fire_low_memory() {
+        // Guards the `total_bytes > 0` check that avoids a division by zero
+        // computing `free_ratio` -- a real `Snapshot` should never have a
+        // zero total, but a malformed/future one shouldn't crash `evaluate`.
+        let mut snap = healthy_snapshot();
+        snap.memory.total_bytes = 0;
+        snap.memory.free_bytes = 0;
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert!(alerts.iter().all(|a| a.key != "low_memory"));
     }
 
     #[test]

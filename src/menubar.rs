@@ -7,12 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tao::event::{Event, StartCause};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// `~/.vigil/status.json` — same home-relative convention as
 /// `incidents::default_dir`, for the same reason (vigil runs from anywhere).
@@ -22,7 +17,7 @@ pub fn default_status_file() -> PathBuf {
 }
 
 #[derive(Serialize, Deserialize)]
-struct StatusFile {
+pub(crate) struct StatusFile {
     updated_unix: u64,
     open_count: usize,
 }
@@ -44,13 +39,13 @@ pub fn write_status(path: &str, open_count: usize) {
     }
 }
 
-fn read_status(path: &Path) -> Option<StatusFile> {
+pub(crate) fn read_status(path: &Path) -> Option<StatusFile> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HealthLevel {
+pub(crate) enum HealthLevel {
     Ok,
     Warning,
     Critical,
@@ -62,7 +57,7 @@ enum HealthLevel {
 
 /// Pure classification — no I/O. `status` is already-parsed file content
 /// (`None` if the file is missing/unparseable).
-fn classify_health(status: Option<&StatusFile>, now_unix: u64, stale_after_secs: u64) -> HealthLevel {
+pub(crate) fn classify_health(status: Option<&StatusFile>, now_unix: u64, stale_after_secs: u64) -> HealthLevel {
     let Some(status) = status else { return HealthLevel::Unknown };
     if now_unix.saturating_sub(status.updated_unix) > stale_after_secs {
         return HealthLevel::Unknown;
@@ -80,7 +75,7 @@ const ICON_SIZE: u32 = 22;
 /// than loaded from a bundled asset — see the ADR. `Ok` is a faint outline
 /// rather than fully invisible pixels, so the tray item stays locatable
 /// while still reading as "nothing to see here".
-fn icon_rgba(level: HealthLevel) -> (Vec<u8>, u32, u32) {
+pub(crate) fn icon_rgba(level: HealthLevel) -> (Vec<u8>, u32, u32) {
     let (r, g, b, a): (u8, u8, u8, u8) = match level {
         HealthLevel::Ok => (255, 255, 255, 40),
         HealthLevel::Warning => (255, 190, 20, 255),
@@ -111,114 +106,6 @@ pub struct MenubarOptions {
     pub status_file: String,
     pub incidents_dir: String,
     pub poll_interval: Duration,
-}
-
-enum UserEvent {
-    /// Only used to wake the event loop early on a tray click — macOS
-    /// already opens the attached menu on its own, so the event's own
-    /// payload is never inspected.
-    Tray,
-    Menu(MenuEvent),
-}
-
-/// Blocks for the process's lifetime, same as `ui::run` — launched as its
-/// own long-running process alongside `vigil watch`.
-pub fn run(opts: MenubarOptions) {
-    let mut builder = EventLoopBuilder::<UserEvent>::with_user_event();
-    let mut event_loop = builder.build();
-    // Menu-bar-only utility: no Dock icon, no app-switcher entry.
-    event_loop.set_activation_policy(ActivationPolicy::Accessory);
-
-    let proxy = event_loop.create_proxy();
-    TrayIconEvent::set_event_handler(Some(move |_event| {
-        let _ = proxy.send_event(UserEvent::Tray);
-    }));
-    let proxy = event_loop.create_proxy();
-    MenuEvent::set_event_handler(Some(move |event| {
-        let _ = proxy.send_event(UserEvent::Menu(event));
-    }));
-
-    let stale_after_secs = opts.poll_interval.as_secs().max(1) * 3;
-    let mut tray: Option<TrayIcon> = None;
-    let mut last_level: Option<HealthLevel> = None;
-    let mut last_poll = Instant::now() - opts.poll_interval;
-    let mut incident_paths: Vec<PathBuf> = Vec::new();
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(400));
-
-        match event {
-            Event::NewEvents(StartCause::Init) => {
-                let (rgba, w, h) = icon_rgba(HealthLevel::Unknown);
-                let icon = Icon::from_rgba(rgba, w, h).expect("failed to build tray icon");
-                tray = Some(
-                    TrayIconBuilder::new()
-                        .with_icon(icon)
-                        .with_menu(Box::new(build_menu(&[])))
-                        .with_tooltip("vigil: waiting for status...")
-                        .build()
-                        .expect("failed to create tray icon"),
-                );
-            }
-            Event::UserEvent(UserEvent::Menu(menu_event)) => {
-                if menu_event.id == "quit" {
-                    *control_flow = ControlFlow::Exit;
-                } else if let Some(path) = incident_paths.iter().find(|p| p.to_string_lossy() == menu_event.id.0) {
-                    let _ = std::process::Command::new("open").arg(path).spawn();
-                }
-            }
-            _ => {}
-        }
-
-        if last_poll.elapsed() >= opts.poll_interval {
-            last_poll = Instant::now();
-
-            let status = read_status(Path::new(&opts.status_file));
-            let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            let level = classify_health(status.as_ref(), now_unix, stale_after_secs);
-
-            if Some(level) != last_level {
-                last_level = Some(level);
-                if let Some(tray) = &tray {
-                    let (rgba, w, h) = icon_rgba(level);
-                    if let Ok(icon) = Icon::from_rgba(rgba, w, h) {
-                        let _ = tray.set_icon(Some(icon));
-                    }
-                    let _ = tray.set_tooltip(Some(match level {
-                        HealthLevel::Ok => "vigil: all clear",
-                        HealthLevel::Warning => "vigil: 1 open incident",
-                        HealthLevel::Critical => "vigil: multiple open incidents",
-                        HealthLevel::Unknown => "vigil: watch not reporting",
-                    }));
-                }
-            }
-
-            incident_paths = crate::incidents::list(Path::new(&opts.incidents_dir)).unwrap_or_default();
-            incident_paths.reverse(); // most recent first
-            incident_paths.truncate(8);
-            if let Some(tray) = &tray {
-                tray.set_menu(Some(Box::new(build_menu(&incident_paths))));
-            }
-        }
-    });
-}
-
-fn build_menu(incidents: &[PathBuf]) -> Menu {
-    let menu = Menu::new();
-    if incidents.is_empty() {
-        let _ = menu.append(&MenuItem::new("No incidents yet", false, None));
-    } else {
-        for path in incidents {
-            let title = std::fs::read_to_string(path)
-                .ok()
-                .map(|c| crate::incidents::extract_title(&c).to_string())
-                .unwrap_or_else(|| "(unreadable)".to_string());
-            let _ = menu.append(&MenuItem::with_id(path.to_string_lossy().to_string(), title, true, None));
-        }
-    }
-    let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id("quit", "Quit vigil menubar", true, None));
-    menu
 }
 
 #[cfg(test)]
@@ -303,5 +190,31 @@ mod tests {
     #[test]
     fn default_status_file_is_under_home() {
         assert!(default_status_file().ends_with(".vigil/status.json"));
+    }
+
+    #[test]
+    fn write_status_then_read_status_round_trips() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("vigil-menubar-test-{}.json", std::process::id()));
+        write_status(path.to_str().unwrap(), 2);
+
+        let status = read_status(&path).expect("just-written status file should parse");
+        assert_eq!(status.open_count, 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_status_to_an_unwritable_path_does_not_panic() {
+        // No such directory -- `std::fs::write` fails, and `write_status`
+        // is documented to just log that, not propagate or panic.
+        write_status("/nonexistent-dir-for-vigil-tests/status.json", 0);
+    }
+
+    #[test]
+    fn read_status_returns_none_for_a_missing_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("vigil-menubar-missing-{}.json", std::process::id()));
+        assert!(read_status(&path).is_none());
     }
 }

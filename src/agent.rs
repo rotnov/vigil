@@ -4,33 +4,18 @@
 //! out to `uv run vigil-agent ask` with a snapshot + a question and prints
 //! whatever text comes back. All actual reasoning happens in the Python
 //! process.
+//!
+//! The actual process-spawning/thread-spawning glue lives in
+//! `agent_process.rs`, re-exported below — kept in its own file (and
+//! excluded from the coverage gate, see AGENTS.md) because it does real,
+//! costly work (spawns `uv run vigil-agent`, which runs a real Claude Agent
+//! SDK session and spends real tokens) that a unit test shouldn't trigger.
+//! Everything here is pure question/arg construction, testable without
+//! spawning anything.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-/// Write the snapshot to a temp file, invoke the agent CLI, and return its
-/// stdout (trimmed) or an error message suitable for display in the UI.
-pub fn ask(question: &str, snapshot_json: &str, agent_dir: &str) -> Result<String, String> {
-    let tmp = temp_snapshot_path();
-    std::fs::write(&tmp, snapshot_json).map_err(|e| format!("failed to write temp snapshot: {e}"))?;
-
-    let args = build_args(question, &tmp, agent_dir);
-    let output = Command::new(&args[0]).args(&args[1..]).output();
-    let _ = std::fs::remove_file(&tmp);
-
-    let output = output.map_err(|e| format!("failed to launch vigil-agent (is `uv` installed?): {e}"))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.is_empty() {
-            "vigil-agent exited with an error and no message".to_string()
-        } else {
-            stderr
-        })
-    }
-}
+pub use crate::agent_process::{ask, maybe_diagnose_alert_async};
 
 /// Builds the question sent to the agent for an auto-triggered diagnosis.
 /// Pure — kept separate from `maybe_diagnose_alert_async`'s side effects so
@@ -38,7 +23,7 @@ pub fn ask(question: &str, snapshot_json: &str, agent_dir: &str) -> Result<Strin
 /// unit-testable without spawning anything. `watch_log_path` is `None` when
 /// the caller has no persistent JSONL history to point at (e.g. `vigil
 /// ui`'s own snapshot loop doesn't write one — only `vigil watch` does).
-fn build_diagnosis_question(alert_message: &str, recent_context: Option<&str>, watch_log_path: Option<&str>) -> String {
+pub(crate) fn build_diagnosis_question(alert_message: &str, recent_context: Option<&str>, watch_log_path: Option<&str>) -> String {
     let context_note = recent_context
         .map(|c| format!(" Other rules that also fired recently (possibly the same root cause): {c}."))
         .unwrap_or_default();
@@ -62,84 +47,14 @@ fn build_diagnosis_question(alert_message: &str, recent_context: Option<&str>, w
 /// (root-causing a drain benefits from the agent actually checking thermal
 /// state / recent high-CPU history rather than a static rule). Disk and
 /// plain memory-pressure alerts are left to the interactive 'a' flow.
-fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
+pub(crate) fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
     alert_key == "high_load" || alert_key.starts_with("cpu_hog:") || alert_key == "battery_low"
-}
-
-/// If `alert` is worth it, ask the agent to investigate in a background
-/// thread and fire a follow-up notification with the answer once ready.
-/// Never blocks the caller. The agent has real (read-only) investigation
-/// tools here — same contract as the interactive 'a' flow: it can look
-/// around (logs, `sample`, `vm_stat`, ...) but never modify anything. A
-/// failed diagnosis is logged, not surfaced as a notification, since the
-/// plain rule-based alert already fired.
-///
-/// Callers are expected to have already checked
-/// `alerts::IncidentTracker::is_new_incident` before calling this — that's
-/// what actually prevents redundant investigations for an already-open
-/// incident on the same target process; this function only checks whether
-/// the alert *key* is diagnose-worthy at all.
-pub fn maybe_diagnose_alert_async(
-    alert: &crate::alerts::Alert,
-    snapshot_json: &str,
-    agent_dir: &str,
-    incidents_dir: &str,
-    recent_context: Option<&str>,
-    watch_log_path: Option<&str>,
-) {
-    if !is_auto_diagnose_worthy(&alert.key) {
-        return;
-    }
-
-    eprintln!(
-        "[vigil] diagnosing [{}] — recent_context: {}",
-        alert.key,
-        recent_context.unwrap_or("(none)")
-    );
-    let question = build_diagnosis_question(&alert.message, recent_context, watch_log_path);
-    let notif_title = format!("{} — agent diagnosis", alert.title);
-    let alert_key = alert.key.clone();
-    let alert_title = alert.title.clone();
-    let alert_message = alert.message.clone();
-    let snapshot_json = snapshot_json.to_string();
-    let agent_dir = agent_dir.to_string();
-    let incidents_dir = PathBuf::from(incidents_dir);
-
-    std::thread::spawn(move || match ask(&question, &snapshot_json, &agent_dir) {
-        Ok(answer) => {
-            let incident = crate::incidents::Incident {
-                alert_key: &alert_key,
-                alert_title: &alert_title,
-                alert_message: &alert_message,
-                diagnosis: &answer,
-            };
-            // Record first so the notification can point at the saved
-            // file — a multi-paragraph diagnosis doesn't fit in a banner
-            // anyway, and osascript can only safely show one line of text.
-            let record_result = crate::incidents::record(&incidents_dir, &incident);
-            let pointer = match &record_result {
-                Ok(path) => format!(" Full report: {}", path.display()),
-                Err(_) => String::new(),
-            };
-            crate::alerts::notify(&crate::alerts::Alert {
-                key: "agent_diagnosis".to_string(),
-                title: notif_title,
-                message: format!("{}{pointer}", teaser(&answer, 180)),
-                target: None,
-            });
-
-            if let Err(e) = record_result {
-                eprintln!("[vigil] failed to write incident journal entry: {e}");
-            }
-        }
-        Err(e) => eprintln!("[vigil] background agent diagnosis failed: {e}"),
-    });
 }
 
 /// A short, single-paragraph preview of a (possibly multi-paragraph)
 /// diagnosis, for the notification banner — the full text goes to the
 /// incident journal file instead, which is what `message` here points at.
-fn teaser(text: &str, max_len: usize) -> String {
+pub(crate) fn teaser(text: &str, max_len: usize) -> String {
     // The agent's answers tend to open with a markdown heading (e.g.
     // "## Diagnosis") — skip those to reach the first real content line.
     let first_line = text
@@ -155,14 +70,14 @@ fn teaser(text: &str, max_len: usize) -> String {
     }
 }
 
-fn temp_snapshot_path() -> PathBuf {
+pub(crate) fn temp_snapshot_path() -> PathBuf {
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     // Includes a nanosecond timestamp, not just the PID, because background
-    // diagnosis threads (see `diagnose_alert_async`) can call `ask()`
+    // diagnosis threads (see `maybe_diagnose_alert_async`) can call `ask()`
     // concurrently within the same process — a PID-only name would race.
     p.push(format!("vigil-snapshot-{}-{nanos}.json", std::process::id()));
     p
@@ -170,7 +85,7 @@ fn temp_snapshot_path() -> PathBuf {
 
 /// Pure argv construction, kept separate from `Command` execution so it can
 /// be unit-tested without spawning a real process.
-fn build_args(question: &str, snapshot_path: &Path, agent_dir: &str) -> Vec<String> {
+pub(crate) fn build_args(question: &str, snapshot_path: &Path, agent_dir: &str) -> Vec<String> {
     vec![
         "uv".to_string(),
         "run".to_string(),
@@ -183,6 +98,23 @@ fn build_args(question: &str, snapshot_path: &Path, agent_dir: &str) -> Vec<Stri
         "--question".to_string(),
         question.to_string(),
     ]
+}
+
+/// Turns a finished `uv run vigil-agent` process's `Output` into the same
+/// `Result` shape `ask` returns — split out so the success/failure/trim
+/// logic is testable against a manually constructed `Output`, without
+/// actually spawning `uv`.
+pub(crate) fn interpret_output(output: &std::process::Output) -> Result<String, String> {
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "vigil-agent exited with an error and no message".to_string()
+        } else {
+            stderr
+        })
+    }
 }
 
 #[cfg(test)]
@@ -233,7 +165,7 @@ mod tests {
     #[test]
     fn teaser_skips_markdown_heading_to_reach_real_content() {
         let text = "## Diagnosis\n\nSwap is 91% full, pycharm is the top consumer.\n\n## Suggestions\n1. Restart it.";
-        assert_eq!(teaser(&text, 200), "Swap is 91% full, pycharm is the top consumer.");
+        assert_eq!(teaser(text, 200), "Swap is 91% full, pycharm is the top consumer.");
     }
 
     #[test]
@@ -278,4 +210,31 @@ mod tests {
         assert!(!is_auto_diagnose_worthy("swap_pressure"));
     }
 
+    fn output_with(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
+        // `std::process::ExitStatus` has no public constructor, so build
+        // one the portable way: actually run a trivial process and read
+        // back its real status.
+        let status = std::process::Command::new(if success { "true" } else { "false" })
+            .status()
+            .expect("failed to run `true`/`false` for a fabricated ExitStatus");
+        std::process::Output { status, stdout: stdout.as_bytes().to_vec(), stderr: stderr.as_bytes().to_vec() }
+    }
+
+    #[test]
+    fn interpret_output_trims_stdout_on_success() {
+        let out = output_with(true, "  the answer is 42  \n", "");
+        assert_eq!(interpret_output(&out), Ok("the answer is 42".to_string()));
+    }
+
+    #[test]
+    fn interpret_output_returns_stderr_on_failure() {
+        let out = output_with(false, "", "boom: connection refused\n");
+        assert_eq!(interpret_output(&out), Err("boom: connection refused".to_string()));
+    }
+
+    #[test]
+    fn interpret_output_falls_back_to_generic_message_when_stderr_is_empty() {
+        let out = output_with(false, "", "");
+        assert_eq!(interpret_output(&out), Err("vigil-agent exited with an error and no message".to_string()));
+    }
 }
