@@ -40,17 +40,93 @@ impl History {
     }
 
     fn push(&mut self, cpu_pct: f32, mem_pct: f32) {
-        push_capped(&mut self.cpu, cpu_pct.round() as u64);
-        push_capped(&mut self.mem, mem_pct.round() as u64);
+        push_capped(&mut self.cpu, cpu_pct.round() as u64, HISTORY_LEN);
+        push_capped(&mut self.mem, mem_pct.round() as u64, HISTORY_LEN);
     }
 }
 
-fn push_capped(buf: &mut VecDeque<u64>, v: u64) {
-    if buf.len() == HISTORY_LEN {
+fn push_capped(buf: &mut VecDeque<u64>, v: u64, cap: usize) {
+    if buf.len() == cap {
         buf.pop_front();
     }
     buf.push_back(v);
 }
+
+const PROC_TREND_LEN: usize = 10;
+/// A process's memory needs to move by more than this, oldest-to-newest
+/// sample in its tracked window, to read as a real trend rather than
+/// ordinary sample-to-sample noise.
+const PROC_TREND_THRESHOLD: f64 = 0.10;
+
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum Trend {
+    Up,
+    Down,
+    Stable,
+}
+
+impl Trend {
+    fn arrow(self) -> &'static str {
+        match self {
+            Trend::Up => "↑",
+            Trend::Down => "↓",
+            Trend::Stable => "→",
+        }
+    }
+}
+
+/// Per-process memory history, tracked across ticks — answers "is this
+/// process growing" at a glance, without needing to ask the agent. A
+/// process can rank at the top of `top_mem` on a single snapshot without
+/// that telling you whether it just spiked or has been climbing for an
+/// hour; this is the same distinction `agent::build_diagnosis_question`'s
+/// watch-log pointer exists to make for the agent's own answers.
+struct ProcTrends {
+    history: std::collections::HashMap<u32, VecDeque<u64>>,
+}
+
+impl ProcTrends {
+    fn new() -> Self {
+        Self { history: std::collections::HashMap::new() }
+    }
+
+    fn record(&mut self, sys: &System) {
+        let seen: std::collections::HashSet<u32> = sys.processes().keys().map(|p| p.as_u32()).collect();
+        self.history.retain(|pid, _| seen.contains(pid));
+        for (pid, p) in sys.processes() {
+            let buf = self.history.entry(pid.as_u32()).or_insert_with(|| VecDeque::with_capacity(PROC_TREND_LEN));
+            push_capped(buf, p.memory(), PROC_TREND_LEN);
+        }
+    }
+
+    /// `None` until enough samples have accumulated for `pid` to say
+    /// anything (a just-started or just-noticed process).
+    fn mem_trend(&self, pid: u32) -> Option<Trend> {
+        let buf = self.history.get(&pid)?;
+        if buf.len() < 2 {
+            return None;
+        }
+        Some(classify_trend(*buf.front().unwrap(), *buf.back().unwrap()))
+    }
+}
+
+/// Pure comparison, split out of `ProcTrends::mem_trend` so it's testable
+/// without a real `sysinfo::System` (which can't be handed fabricated
+/// per-PID memory values in a unit test).
+fn classify_trend(oldest: u64, newest: u64) -> Trend {
+    if oldest == 0 {
+        return Trend::Stable;
+    }
+    let change = (newest as f64 - oldest as f64) / oldest as f64;
+    if change > PROC_TREND_THRESHOLD {
+        Trend::Up
+    } else if change < -PROC_TREND_THRESHOLD {
+        Trend::Down
+    } else {
+        Trend::Stable
+    }
+}
+
 
 /// Snapshot of interactive state needed to render a frame. Kept separate
 /// from the event loop so `draw` stays a pure function of (system, history,
@@ -103,6 +179,7 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
     let mut sys = System::new_all();
     let cpu_count = sys.cpus().len().max(1);
     let mut history = History::new();
+    let mut trends = ProcTrends::new();
     let mut app = AppState::new(opts.top_n);
     let mut alert_state = AlertState::new();
     let mut recent_alerts = crate::alerts::RecentAlerts::new();
@@ -163,9 +240,10 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                 (sys.global_cpu_usage(), mem_percent(&sys))
             };
             history.push(cpu_pct, mem_pct);
+            trends.record(&sys);
         }
 
-        terminal.draw(|f| draw(f, &sys, &history, &app))?;
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app))?;
 
         let timeout = opts
             .interval
@@ -188,7 +266,7 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                             if !question.is_empty() {
                                 app.thinking = true;
                                 app.answer = None;
-                                terminal.draw(|f| draw(f, &sys, &history, &app))?;
+                                terminal.draw(|f| draw(f, &sys, &history, &trends, &app))?;
 
                                 let snap = crate::take_snapshot(&mut sys, opts.top_n);
                                 let snapshot_json = serde_json::to_string(&snap).unwrap_or_default();
@@ -243,7 +321,7 @@ fn mem_percent(sys: &System) -> f32 {
     }
 }
 
-fn draw(f: &mut Frame, sys: &System, history: &History, app: &AppState) {
+fn draw(f: &mut Frame, sys: &System, history: &History, trends: &ProcTrends, app: &AppState) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -256,7 +334,7 @@ fn draw(f: &mut Frame, sys: &System, history: &History, app: &AppState) {
 
     draw_header(f, root[0], sys, app);
     draw_sparklines(f, root[1], history);
-    draw_process_table(f, root[2], sys, app.top_n);
+    draw_process_table(f, root[2], sys, trends, app.top_n);
     draw_footer(f, root[3], app);
 
     if app.input_mode {
@@ -330,7 +408,7 @@ fn draw_sparklines(f: &mut Frame, area: Rect, history: &History) {
     f.render_widget(mem_spark, cols[1]);
 }
 
-fn draw_process_table(f: &mut Frame, area: Rect, sys: &System, top_n: usize) {
+fn draw_process_table(f: &mut Frame, area: Rect, sys: &System, trends: &ProcTrends, top_n: usize) {
     let mut procs: Vec<&sysinfo::Process> = sys.processes().values().collect();
     procs.sort_by(|a, b| b.cpu_usage().partial_cmp(&a.cpu_usage()).unwrap());
 
@@ -339,11 +417,15 @@ fn draw_process_table(f: &mut Frame, area: Rect, sys: &System, top_n: usize) {
         .take(top_n)
         .map(|p| {
             let mem_mb = p.memory() as f64 / 1e6;
+            // Whether this process has been growing/shrinking, not just
+            // what it's using right now — see ProcTrends's own doc comment
+            // for why. Blank (not "→") until enough samples exist to say.
+            let arrow = trends.mem_trend(p.pid().as_u32()).map(Trend::arrow).unwrap_or(" ");
             Row::new(vec![
                 Cell::from(p.pid().to_string()),
                 Cell::from(p.name().to_string_lossy().to_string()),
                 Cell::from(format!("{:>6.1}%", p.cpu_usage())),
-                Cell::from(format!("{mem_mb:>8.1} MB")),
+                Cell::from(format!("{mem_mb:>8.1} MB {arrow}")),
             ])
         })
         .collect();
@@ -352,7 +434,7 @@ fn draw_process_table(f: &mut Frame, area: Rect, sys: &System, top_n: usize) {
         Constraint::Length(8),
         Constraint::Min(20),
         Constraint::Length(8),
-        Constraint::Length(12),
+        Constraint::Length(14),
     ];
 
     let table = Table::new(rows, widths)
@@ -360,7 +442,7 @@ fn draw_process_table(f: &mut Frame, area: Rect, sys: &System, top_n: usize) {
             Row::new(vec!["PID", "NAME", "CPU", "MEM"])
                 .style(Style::default().add_modifier(Modifier::BOLD)),
         )
-        .block(Block::default().borders(Borders::ALL).title(" top processes (by CPU) "));
+        .block(Block::default().borders(Borders::ALL).title(" top processes (by CPU) — mem trend over last 10 samples "));
 
     f.render_widget(table, area);
 }
@@ -449,6 +531,51 @@ mod tests {
     }
 
     #[test]
+    fn classify_trend_stable_within_threshold() {
+        assert_eq!(classify_trend(1000, 1050), Trend::Stable); // +5%
+        assert_eq!(classify_trend(1000, 950), Trend::Stable); // -5%
+    }
+
+    #[test]
+    fn classify_trend_up_beyond_threshold() {
+        assert_eq!(classify_trend(1000, 1200), Trend::Up); // +20%
+    }
+
+    #[test]
+    fn classify_trend_down_beyond_threshold() {
+        assert_eq!(classify_trend(1000, 800), Trend::Down); // -20%
+    }
+
+    #[test]
+    fn classify_trend_treats_zero_oldest_as_stable() {
+        // Can't compute a meaningful percent change from zero -- avoid a
+        // division-by-zero producing a spurious "Up" for a process that
+        // simply wasn't tracked before this sample.
+        assert_eq!(classify_trend(0, 500), Trend::Stable);
+    }
+
+    #[test]
+    fn mem_trend_is_none_with_fewer_than_two_samples() {
+        let mut trends = ProcTrends::new();
+        trends.history.insert(42, VecDeque::from([1000]));
+        assert_eq!(trends.mem_trend(42), None);
+    }
+
+    #[test]
+    fn mem_trend_is_none_for_an_unknown_pid() {
+        let trends = ProcTrends::new();
+        assert_eq!(trends.mem_trend(999), None);
+    }
+
+    #[test]
+    fn mem_trend_compares_oldest_to_newest_in_the_window() {
+        let mut trends = ProcTrends::new();
+        // Dips in the middle don't matter -- only the window's endpoints.
+        trends.history.insert(7, VecDeque::from([1000, 200, 1300]));
+        assert_eq!(trends.mem_trend(7), Some(Trend::Up));
+    }
+
+    #[test]
     fn history_caps_at_max_length_and_keeps_most_recent() {
         let mut h = History::new();
         for i in 0..(HISTORY_LEN as u64 + 10) {
@@ -464,11 +591,12 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let sys = System::new_all();
+        let trends = ProcTrends::new();
         let mut history = History::new();
         history.push(42.0, 55.0);
         let app = AppState::new(5);
 
-        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("system"));
@@ -486,13 +614,14 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let sys = System::new_all();
+        let trends = ProcTrends::new();
         let history = History::new();
         let mut app = AppState::new(5);
         app.battery_pct = Some(37);
         app.battery_charging = Some(false);
         app.battery_eta_secs = Some(42 * 60);
 
-        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("37%"));
@@ -505,12 +634,13 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let sys = System::new_all();
+        let trends = ProcTrends::new();
         let history = History::new();
         let mut app = AppState::new(5);
         app.battery_pct = Some(80);
         app.battery_charging = Some(true);
 
-        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("80%"));
@@ -542,12 +672,13 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let sys = System::new_all();
+        let trends = ProcTrends::new();
         let history = History::new();
         let mut app = AppState::new(5);
         app.input_mode = true;
         app.input_buffer = "why is disk space low?".to_string();
 
-        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("why is disk space low?"));
@@ -559,11 +690,12 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let sys = System::new_all();
+        let trends = ProcTrends::new();
         let history = History::new();
         let mut app = AppState::new(5);
         app.answer = Some(Ok("Disk is almost full because of Docker".to_string()));
 
-        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("Docker"));
@@ -575,11 +707,12 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let sys = System::new_all();
+        let trends = ProcTrends::new();
         let history = History::new();
         let mut app = AppState::new(5);
         app.answer = Some(Err("uv not found".to_string()));
 
-        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("uv not found"));
@@ -591,11 +724,12 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let sys = System::new_all();
+        let trends = ProcTrends::new();
         let history = History::new();
         let mut app = AppState::new(5);
         app.push_alert("[low_disk:/] low disk space".to_string());
 
-        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("low disk space"));
