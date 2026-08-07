@@ -48,6 +48,15 @@ answer once it's done, and the diagnosis is saved as a markdown file in
 and plain memory-pressure alerts don't auto-trigger the agent, and the interactive `a`
 flow is UI-only — neither writes to the incident journal.
 
+Because that investigation runs seconds to minutes after the alert fired, the flagged
+process's pid can already have been recycled by the OS to something unrelated by the
+time the agent checks it — observed live (see
+`2026-08-07-14-20-56-cpu-hog-27339.md`): an alert named "claude" whose pid had already
+become an unrelated `bfs` scan. Process-targeted alerts (`high_load`/`swap_pressure`/
+`low_memory`/`cpu_hog`/`battery_low`) capture the process's full command line
+synchronously, at the moment they fire, and hand it to the agent alongside the alert
+so a stale-by-the-time-you-check pid doesn't get misattributed.
+
 Repeat firings for the same process are treated as one ongoing incident, not a fresh
 one each time: `alerts::IncidentTracker` skips the notification, the diagnosis, and
 the journal entry for a target that already has one open (still firing within twice

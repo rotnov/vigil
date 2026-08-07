@@ -56,7 +56,7 @@ pub fn maybe_diagnose_alert_async(
         alert.key,
         recent_context.unwrap_or("(none)")
     );
-    let question = build_diagnosis_question(&alert.message, recent_context, watch_log_path);
+    let question = build_diagnosis_question(&alert.message, recent_context, watch_log_path, alert.command.as_deref());
     let notif_title = format!("{} — agent diagnosis", alert.title);
     let alert_key = alert.key.clone();
     let alert_title = alert.title.clone();
@@ -86,6 +86,7 @@ pub fn maybe_diagnose_alert_async(
                 title: notif_title,
                 message: format!("{}{pointer}", teaser(&answer, 180)),
                 target: None,
+                command: None,
             });
 
             if let Err(e) = record_result {

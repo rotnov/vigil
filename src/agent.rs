@@ -19,11 +19,21 @@ pub use crate::agent_process::{ask, maybe_diagnose_alert_async};
 
 /// Builds the question sent to the agent for an auto-triggered diagnosis.
 /// Pure — kept separate from `maybe_diagnose_alert_async`'s side effects so
-/// the exact wording (cross-alert context, the watch-log pointer) is
-/// unit-testable without spawning anything. `watch_log_path` is `None` when
-/// the caller has no persistent JSONL history to point at (e.g. `vigil
-/// ui`'s own snapshot loop doesn't write one — only `vigil watch` does).
-pub(crate) fn build_diagnosis_question(alert_message: &str, recent_context: Option<&str>, watch_log_path: Option<&str>) -> String {
+/// the exact wording (cross-alert context, the watch-log pointer, the
+/// pid-reuse warning) is unit-testable without spawning anything.
+/// `watch_log_path` is `None` when the caller has no persistent JSONL
+/// history to point at (e.g. `vigil ui`'s own snapshot loop doesn't write
+/// one — only `vigil watch` does). `command` is `Alert::command` — the
+/// target process's full command line, captured synchronously at the
+/// moment the alert fired (see that field's doc comment for why: this
+/// diagnosis runs seconds to minutes later, in the background, and by then
+/// the OS may have recycled the pid to a completely different process).
+pub(crate) fn build_diagnosis_question(
+    alert_message: &str,
+    recent_context: Option<&str>,
+    watch_log_path: Option<&str>,
+    command: Option<&str>,
+) -> String {
     let context_note = recent_context
         .map(|c| format!(" Other rules that also fired recently (possibly the same root cause): {c}."))
         .unwrap_or_default();
@@ -35,8 +45,18 @@ pub(crate) fn build_diagnosis_question(alert_message: &str, recent_context: Opti
         ),
         None => String::new(),
     };
+    let command_note = match command {
+        Some(cmd) if !cmd.is_empty() => format!(
+            " The flagged process's command line at the moment this fired was: `{cmd}`. Note this pid \
+             may already refer to a different process by the time you check it (pids get reused) — if \
+             `ps -p <pid>` shows something else now, trust the command line above for what was actually \
+             running, not whatever the pid currently points to."
+        ),
+        Some(_) => String::new(), // empty cmd: the process was mid fork/exec when sampled, nothing useful to quote
+        None => String::new(),
+    };
     format!(
-        "A monitoring rule just fired: \"{alert_message}\".{context_note}{history_note} Investigate \
+        "A monitoring rule just fired: \"{alert_message}\".{context_note}{history_note}{command_note} Investigate \
          the likely cause — check beyond the snapshot if useful (e.g. logs, `sample` a hot pid, \
          thermal state) — and suggest what to check or do next."
     )
@@ -123,33 +143,55 @@ mod tests {
 
     #[test]
     fn build_diagnosis_question_includes_the_alert_message() {
-        let q = build_diagnosis_question("pycharm has held 129% CPU", None, None);
+        let q = build_diagnosis_question("pycharm has held 129% CPU", None, None, None);
         assert!(q.contains("pycharm has held 129% CPU"));
     }
 
     #[test]
     fn build_diagnosis_question_includes_recent_context_when_present() {
-        let q = build_diagnosis_question("high load", Some("swap is 91% full"), None);
+        let q = build_diagnosis_question("high load", Some("swap is 91% full"), None, None);
         assert!(q.contains("swap is 91% full"));
     }
 
     #[test]
     fn build_diagnosis_question_omits_context_note_when_none() {
-        let q = build_diagnosis_question("high load", None, None);
+        let q = build_diagnosis_question("high load", None, None, None);
         assert!(!q.contains("also fired recently"));
     }
 
     #[test]
     fn build_diagnosis_question_points_at_the_watch_log_when_given_a_path() {
-        let q = build_diagnosis_question("high load", None, Some("/Users/denis/.vigil/watch.jsonl"));
+        let q = build_diagnosis_question("high load", None, Some("/Users/denis/.vigil/watch.jsonl"), None);
         assert!(q.contains("/Users/denis/.vigil/watch.jsonl"));
         assert!(q.contains("growing over"));
     }
 
     #[test]
     fn build_diagnosis_question_omits_history_note_without_a_watch_log_path() {
-        let q = build_diagnosis_question("high load", None, None);
+        let q = build_diagnosis_question("high load", None, None, None);
         assert!(!q.contains("growing over"));
+    }
+
+    #[test]
+    fn build_diagnosis_question_includes_the_command_line_and_a_pid_reuse_warning() {
+        let q = build_diagnosis_question("claude (pid 27339) has held 177% CPU", None, None, Some("bfs -S dfs / -path *"));
+        assert!(q.contains("bfs -S dfs / -path *"));
+        assert!(q.contains("pids get reused"));
+    }
+
+    #[test]
+    fn build_diagnosis_question_omits_command_note_when_none() {
+        let q = build_diagnosis_question("high load", None, None, None);
+        assert!(!q.contains("pids get reused"));
+    }
+
+    #[test]
+    fn build_diagnosis_question_omits_command_note_when_command_is_empty() {
+        // An empty `cmd` happens when the process was sampled mid
+        // fork/exec -- nothing useful to quote, so no note rather than a
+        // confusing empty backtick-quote.
+        let q = build_diagnosis_question("high load", None, None, Some(""));
+        assert!(!q.contains("pids get reused"));
     }
 
     #[test]
