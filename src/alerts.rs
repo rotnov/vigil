@@ -6,7 +6,7 @@
 //! separate, explicit user confirmation outside this tool.
 
 use crate::Snapshot;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const SWAP_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
@@ -15,6 +15,47 @@ const CPU_HOG_THRESHOLD_PCT: f32 = 90.0;
 const CPU_HOG_STREAK_REQUIRED: u32 = 3;
 const LOW_DISK_AVAILABLE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 const LOW_BATTERY_PCT: u8 = 20;
+const RECENT_ALERTS_WINDOW: Duration = Duration::from_secs(5 * 60);
+const RECENT_ALERTS_CAPACITY: usize = 10;
+
+/// A short rolling log of every alert that fired recently (any key,
+/// including ones that never trigger an agent diagnosis on their own —
+/// e.g. `low_memory`/`swap_pressure`). Fed to the agent as extra context
+/// alongside whichever alert *did* trigger it, so a `cpu_hog` diagnosis
+/// doesn't have to independently rediscover a memory-pressure problem
+/// that another rule already flagged in the same window.
+pub struct RecentAlerts {
+    entries: VecDeque<(Instant, String, String)>,
+}
+
+impl RecentAlerts {
+    pub fn new() -> Self {
+        Self { entries: VecDeque::with_capacity(RECENT_ALERTS_CAPACITY) }
+    }
+
+    pub fn record(&mut self, key: &str, message: &str, now: Instant) {
+        if self.entries.len() == RECENT_ALERTS_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((now, key.to_string(), message.to_string()));
+    }
+
+    /// Messages of other alerts (any key) fired within the recency window,
+    /// excluding `exclude_key` itself. `None` if there's nothing else.
+    pub fn context_excluding(&self, exclude_key: &str, now: Instant) -> Option<String> {
+        let others: Vec<&str> = self
+            .entries
+            .iter()
+            .filter(|(t, k, _)| k != exclude_key && now.duration_since(*t) <= RECENT_ALERTS_WINDOW)
+            .map(|(_, _, m)| m.as_str())
+            .collect();
+        if others.is_empty() {
+            None
+        } else {
+            Some(others.join(" | "))
+        }
+    }
+}
 
 pub struct Alert {
     pub key: String,
@@ -222,8 +263,13 @@ pub fn notify(alert: &Alert) {
         .output();
 }
 
+/// Quotes a string for a single-line `osascript -e` argument. Also
+/// collapses newlines to spaces — a literal `\n` would terminate the `-e`
+/// script mid-statement (unterminated string literal), which is a real risk
+/// here since agent diagnoses are multi-paragraph text.
 fn osa_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let single_line = s.replace(['\n', '\r'], " ");
+    format!("\"{}\"", single_line.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]
@@ -263,6 +309,20 @@ mod tests {
             top_cpu: vec![proc(1, "idle_app", 5.0, 100)],
             top_mem: vec![proc(1, "idle_app", 5.0, 100)],
         }
+    }
+
+    #[test]
+    fn osa_quote_collapses_newlines_to_keep_the_e_script_single_line() {
+        let multiline = "Diagnosis: swap is full.\n\nSuggestions:\n1. Restart pycharm.";
+        let quoted = osa_quote(multiline);
+        assert!(!quoted.contains('\n'), "a literal newline would break `osascript -e`: {quoted:?}");
+        assert!(quoted.contains("Restart pycharm"));
+    }
+
+    #[test]
+    fn osa_quote_still_escapes_quotes_and_backslashes() {
+        let quoted = osa_quote(r#"she said "hi" \ ok"#);
+        assert_eq!(quoted, r#""she said \"hi\" \\ ok""#);
     }
 
     #[test]
@@ -429,5 +489,50 @@ mod tests {
 
         assert!(evaluate_battery(&snap, None, &mut state, cooldown, now).is_some());
         assert!(evaluate_battery(&snap, None, &mut state, cooldown, now).is_none());
+    }
+
+    #[test]
+    fn recent_alerts_context_excludes_self_and_includes_others() {
+        let mut recent = RecentAlerts::new();
+        let now = Instant::now();
+        recent.record("swap_pressure", "Swap usage 13.7 GB", now);
+        recent.record("low_memory", "Only 3.1% memory free", now);
+        recent.record("cpu_hog:37489", "pycharm has held 111% CPU", now);
+
+        let ctx = recent.context_excluding("cpu_hog:37489", now).unwrap();
+        assert!(ctx.contains("Swap usage 13.7 GB"));
+        assert!(ctx.contains("Only 3.1% memory free"));
+        assert!(!ctx.contains("111% CPU"), "must not include the alert's own message");
+    }
+
+    #[test]
+    fn recent_alerts_context_is_none_when_nothing_else_fired() {
+        let mut recent = RecentAlerts::new();
+        let now = Instant::now();
+        recent.record("cpu_hog:1", "only this one", now);
+        assert!(recent.context_excluding("cpu_hog:1", now).is_none());
+        assert!(recent.context_excluding("cpu_hog:2", now).unwrap().contains("only this one"));
+    }
+
+    #[test]
+    fn recent_alerts_context_drops_entries_outside_the_window() {
+        let mut recent = RecentAlerts::new();
+        let now = Instant::now();
+        recent.record("swap_pressure", "stale", now - RECENT_ALERTS_WINDOW - Duration::from_secs(1));
+        recent.record("cpu_hog:1", "current", now);
+
+        assert!(recent.context_excluding("cpu_hog:1", now).is_none(), "the swap_pressure entry is too old to count");
+    }
+
+    #[test]
+    fn recent_alerts_caps_capacity_dropping_oldest_first() {
+        let mut recent = RecentAlerts::new();
+        let now = Instant::now();
+        for i in 0..(RECENT_ALERTS_CAPACITY + 3) {
+            recent.record(&format!("key{i}"), &format!("msg{i}"), now);
+        }
+        let ctx = recent.context_excluding("nonexistent", now).unwrap();
+        assert!(!ctx.contains("msg0"), "oldest entries should have been evicted");
+        assert!(ctx.contains(&format!("msg{}", RECENT_ALERTS_CAPACITY + 2)), "most recent entry must survive");
     }
 }

@@ -105,6 +105,7 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
     let mut history = History::new();
     let mut app = AppState::new(opts.top_n);
     let mut alert_state = AlertState::new();
+    let mut recent_alerts = crate::alerts::RecentAlerts::new();
     let mut battery_trend = crate::battery::BatteryTrend::new();
 
     let mut last_tick = Instant::now() - opts.interval; // force immediate first sample
@@ -133,10 +134,14 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
 
                 let mut fired = crate::alerts::evaluate(&snap, cpu_count, &mut alert_state, opts.cooldown, now);
                 fired.extend(crate::alerts::evaluate_battery(&snap, battery_eta, &mut alert_state, opts.cooldown, now));
+                for alert in &fired {
+                    recent_alerts.record(&alert.key, &alert.message, now);
+                }
                 for alert in fired {
                     app.push_alert(format!("[{}] {}", alert.key, alert.message));
                     crate::alerts::notify(&alert);
-                    crate::agent::maybe_diagnose_alert_async(&alert, &snapshot_json, &opts.agent_dir, &opts.incidents_dir);
+                    let context = recent_alerts.context_excluding(&alert.key, now);
+                    crate::agent::maybe_diagnose_alert_async(&alert, &snapshot_json, &opts.agent_dir, &opts.incidents_dir, context.as_deref());
                 }
                 (sys.global_cpu_usage(), mem_percent(&sys))
             } else {

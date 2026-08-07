@@ -48,15 +48,24 @@ fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
 /// around (logs, `sample`, `vm_stat`, ...) but never modify anything. A
 /// failed diagnosis is logged, not surfaced as a notification, since the
 /// plain rule-based alert already fired.
-pub fn maybe_diagnose_alert_async(alert: &crate::alerts::Alert, snapshot_json: &str, agent_dir: &str, incidents_dir: &str) {
+pub fn maybe_diagnose_alert_async(
+    alert: &crate::alerts::Alert,
+    snapshot_json: &str,
+    agent_dir: &str,
+    incidents_dir: &str,
+    recent_context: Option<&str>,
+) {
     if !is_auto_diagnose_worthy(&alert.key) {
         return;
     }
 
+    let context_note = recent_context
+        .map(|c| format!(" Other rules that also fired recently (possibly the same root cause): {c}."))
+        .unwrap_or_default();
     let question = format!(
-        "A monitoring rule just fired: \"{}\". Investigate the likely cause — check beyond the \
-         snapshot if useful (e.g. logs, `sample` a hot pid, thermal state) — and suggest what to \
-         check or do next.",
+        "A monitoring rule just fired: \"{}\".{context_note} Investigate the likely cause — check \
+         beyond the snapshot if useful (e.g. logs, `sample` a hot pid, thermal state) — and suggest \
+         what to check or do next.",
         alert.message
     );
     let notif_title = format!("{} — agent diagnosis", alert.title);
@@ -69,24 +78,51 @@ pub fn maybe_diagnose_alert_async(alert: &crate::alerts::Alert, snapshot_json: &
 
     std::thread::spawn(move || match ask(&question, &snapshot_json, &agent_dir) {
         Ok(answer) => {
-            crate::alerts::notify(&crate::alerts::Alert {
-                key: "agent_diagnosis".to_string(),
-                title: notif_title,
-                message: answer.clone(),
-            });
-
             let incident = crate::incidents::Incident {
                 alert_key: &alert_key,
                 alert_title: &alert_title,
                 alert_message: &alert_message,
                 diagnosis: &answer,
             };
-            if let Err(e) = crate::incidents::record(&incidents_dir, &incident) {
+            // Record first so the notification can point at the saved
+            // file — a multi-paragraph diagnosis doesn't fit in a banner
+            // anyway, and osascript can only safely show one line of text.
+            let record_result = crate::incidents::record(&incidents_dir, &incident);
+            let pointer = match &record_result {
+                Ok(path) => format!(" Full report: {}", path.display()),
+                Err(_) => String::new(),
+            };
+            crate::alerts::notify(&crate::alerts::Alert {
+                key: "agent_diagnosis".to_string(),
+                title: notif_title,
+                message: format!("{}{pointer}", teaser(&answer, 180)),
+            });
+
+            if let Err(e) = record_result {
                 eprintln!("[vigil] failed to write incident journal entry: {e}");
             }
         }
         Err(e) => eprintln!("[vigil] background agent diagnosis failed: {e}"),
     });
+}
+
+/// A short, single-paragraph preview of a (possibly multi-paragraph)
+/// diagnosis, for the notification banner — the full text goes to the
+/// incident journal file instead, which is what `message` here points at.
+fn teaser(text: &str, max_len: usize) -> String {
+    // The agent's answers tend to open with a markdown heading (e.g.
+    // "## Diagnosis") — skip those to reach the first real content line.
+    let first_line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap_or_else(|| text.trim());
+    if first_line.chars().count() <= max_len {
+        first_line.to_string()
+    } else {
+        let truncated: String = first_line.chars().take(max_len).collect();
+        format!("{}…", truncated.trim_end())
+    }
 }
 
 fn temp_snapshot_path() -> PathBuf {
@@ -131,6 +167,25 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--project".to_string(), "agent".to_string()]));
         assert!(args.contains(&"/tmp/snap.json".to_string()));
         assert!(args.contains(&"why is disk space low?".to_string()));
+    }
+
+    #[test]
+    fn teaser_skips_markdown_heading_to_reach_real_content() {
+        let text = "## Diagnosis\n\nSwap is 91% full, pycharm is the top consumer.\n\n## Suggestions\n1. Restart it.";
+        assert_eq!(teaser(&text, 200), "Swap is 91% full, pycharm is the top consumer.");
+    }
+
+    #[test]
+    fn teaser_truncates_long_lines_with_ellipsis() {
+        let long = "a".repeat(300);
+        let t = teaser(&long, 50);
+        assert_eq!(t.chars().count(), 51); // 50 chars + ellipsis
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn teaser_falls_back_to_whole_text_when_only_headings_present() {
+        assert_eq!(teaser("## Just A Heading", 200), "## Just A Heading");
     }
 
     #[test]

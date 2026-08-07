@@ -302,6 +302,7 @@ fn main() {
             let cpu_count = sys.cpus().len();
             let mut alert_state = alerts::AlertState::new();
             let mut battery_trend = battery::BatteryTrend::new();
+            let mut recent_alerts = alerts::RecentAlerts::new();
             let cooldown = Duration::from_secs(cooldown_secs);
 
             let mut n: u64 = 0;
@@ -331,10 +332,14 @@ fn main() {
                 if !no_notify {
                     let mut fired = alerts::evaluate(&snap, cpu_count, &mut alert_state, cooldown, now);
                     fired.extend(alerts::evaluate_battery(&snap, battery_eta, &mut alert_state, cooldown, now));
+                    for alert in &fired {
+                        recent_alerts.record(&alert.key, &alert.message, now);
+                    }
                     for alert in fired {
                         eprintln!("[vigil] ALERT [{}] {}", alert.key, alert.message);
                         alerts::notify(&alert);
-                        agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir, &incidents_dir);
+                        let context = recent_alerts.context_excluding(&alert.key, now);
+                        agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir, &incidents_dir, context.as_deref());
                     }
                 }
 
