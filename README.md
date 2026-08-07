@@ -27,6 +27,11 @@ without you doing it yourself.
   needing an already-open `ui` session (a TUI can't pop itself open on a push
   notification): `vigil incidents` lists recent ones, `vigil incidents --show <name>`
   prints one in full (accepts a filename or any substring that matches exactly one)
+- `vigil menubar` — a macOS menu bar status item: transparent/faint when nothing's
+  open, yellow for one open incident, red for multiple. Click for a dropdown of
+  recent incidents (opens the markdown file). Polls the status file `vigil watch`
+  writes each tick rather than sampling on its own — see
+  [docs/decisions/0002-menu-bar-health-indicator.md](docs/decisions/0002-menu-bar-health-indicator.md)
 
 When `high_load`, `cpu_hog`, or `battery_low` fires, vigil also asks the agent to
 investigate in a background thread — non-blocking, a follow-up notification with the
@@ -84,6 +89,9 @@ Requires an installed and logged-in [Claude Code](https://claude.com/claude-code
 # browse past auto-diagnoses from a plain shell
 ./target/release/vigil incidents
 ./target/release/vigil incidents --show cpu-hog-64955
+
+# menu bar health indicator (run alongside `vigil watch`, not instead of it)
+./target/release/vigil menubar
 ```
 
 ## Tests
@@ -111,9 +119,12 @@ vigil (Rust)                          agent/ (Python, Claude Agent SDK)
 ├── main.rs — snapshot collection,
 │   incl. connection counts via
 │   `netstat` (see docs/decisions/0001)
-└── agent.rs — shell wrapper around
-    `uv run vigil-agent ask ...`,
-    plus the auto-diagnose trigger
+├── agent.rs — shell wrapper around
+│   `uv run vigil-agent ask ...`,
+│   plus the auto-diagnose trigger
+└── menubar.rs — tray icon, polls the
+    status file `watch` writes each
+    tick (see docs/decisions/0002)
 ```
 
 Project-wide design decisions with a real alternative (a parsing strategy, an alert

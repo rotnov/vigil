@@ -115,6 +115,15 @@ impl IncidentTracker {
         self.last_seen.insert(target.to_string(), now);
         is_new
     }
+
+    /// Number of targets currently within their open incident window as of
+    /// `now` — read-only, doesn't record anything. Used by `vigil menubar`
+    /// (via `vigil watch`'s status-file write) to derive a health color
+    /// without re-running its own sampling/evaluation loop; see
+    /// docs/decisions/0002-menu-bar-health-indicator.md.
+    pub fn open_count(&self, timeout: Duration, now: Instant) -> usize {
+        self.last_seen.values().filter(|t| now.duration_since(**t) < timeout).count()
+    }
 }
 
 pub struct AlertState {
@@ -749,5 +758,39 @@ mod tests {
         let t0 = Instant::now();
         assert!(t.is_new_incident(None, Duration::from_secs(600), t0));
         assert!(t.is_new_incident(None, Duration::from_secs(600), t0));
+    }
+
+    #[test]
+    fn incident_tracker_open_count_reflects_currently_open_targets() {
+        let mut t = IncidentTracker::new();
+        let t0 = Instant::now();
+        assert_eq!(t.open_count(Duration::from_secs(600), t0), 0);
+
+        t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0);
+        assert_eq!(t.open_count(Duration::from_secs(600), t0), 1);
+
+        t.is_new_incident(Some("Devin Helper (Renderer)"), Duration::from_secs(600), t0);
+        assert_eq!(t.open_count(Duration::from_secs(600), t0), 2);
+    }
+
+    #[test]
+    fn incident_tracker_open_count_excludes_targets_past_the_timeout() {
+        let mut t = IncidentTracker::new();
+        let t0 = Instant::now();
+        t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0);
+        let later = t0 + Duration::from_secs(900);
+        assert_eq!(t.open_count(Duration::from_secs(600), later), 0);
+    }
+
+    #[test]
+    fn incident_tracker_open_count_does_not_mutate_state() {
+        let mut t = IncidentTracker::new();
+        let t0 = Instant::now();
+        t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0);
+        // Calling open_count repeatedly must not itself extend the window
+        // the way is_new_incident does.
+        let _ = t.open_count(Duration::from_secs(600), t0 + Duration::from_secs(500));
+        let _ = t.open_count(Duration::from_secs(600), t0 + Duration::from_secs(500));
+        assert!(!t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0 + Duration::from_secs(599)));
     }
 }

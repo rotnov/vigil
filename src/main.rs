@@ -2,6 +2,7 @@ mod agent;
 mod alerts;
 mod battery;
 mod incidents;
+mod menubar;
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -52,6 +53,9 @@ enum Commands {
         /// Directory for the auto-diagnosis incident journal (markdown, one file per diagnosis)
         #[arg(long, default_value_t = default_incidents_dir())]
         incidents_dir: String,
+        /// Health status file, refreshed every tick, that `vigil menubar` polls
+        #[arg(long, default_value_t = default_status_file())]
+        status_file: String,
     },
     /// Live terminal dashboard (CPU/mem sparklines + top processes)
     Ui {
@@ -87,10 +91,26 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Menu bar health indicator — transparent when healthy, yellow/red otherwise
+    Menubar {
+        /// Status file written by `vigil watch` (see --status-file there)
+        #[arg(long, default_value_t = default_status_file())]
+        status_file: String,
+        /// Directory the incident journal is stored in (for the dropdown)
+        #[arg(long, default_value_t = default_incidents_dir())]
+        incidents_dir: String,
+        /// Seconds between polling the status file
+        #[arg(long, default_value_t = 3)]
+        poll_secs: u64,
+    },
 }
 
 fn default_incidents_dir() -> String {
     incidents::default_dir().to_string_lossy().to_string()
+}
+
+fn default_status_file() -> String {
+    menubar::default_status_file().to_string_lossy().to_string()
 }
 
 #[derive(Serialize)]
@@ -402,6 +422,7 @@ fn main() {
             cooldown_secs,
             agent_dir,
             incidents_dir,
+            status_file,
         } => {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
@@ -466,6 +487,8 @@ fn main() {
                     }
                 }
 
+                menubar::write_status(&status_file, incident_tracker.open_count(incident_timeout, now));
+
                 n += 1;
                 if count != 0 && n >= count {
                     break;
@@ -493,6 +516,13 @@ fn main() {
         }
         Commands::Incidents { dir, show, limit } => {
             run_incidents_command(&dir, show.as_deref(), limit);
+        }
+        Commands::Menubar { status_file, incidents_dir, poll_secs } => {
+            menubar::run(menubar::MenubarOptions {
+                status_file,
+                incidents_dir,
+                poll_interval: Duration::from_secs(poll_secs),
+            });
         }
     }
 }
