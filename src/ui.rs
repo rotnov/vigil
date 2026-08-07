@@ -23,6 +23,7 @@ pub struct UiOptions {
     pub notify: bool,
     pub cooldown: Duration,
     pub agent_dir: String,
+    pub incidents_dir: String,
 }
 
 struct History {
@@ -135,7 +136,7 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                 for alert in fired {
                     app.push_alert(format!("[{}] {}", alert.key, alert.message));
                     crate::alerts::notify(&alert);
-                    crate::agent::maybe_diagnose_alert_async(&alert, &snapshot_json, &opts.agent_dir);
+                    crate::agent::maybe_diagnose_alert_async(&alert, &snapshot_json, &opts.agent_dir, &opts.incidents_dir);
                 }
                 (sys.global_cpu_usage(), mem_percent(&sys))
             } else {

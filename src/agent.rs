@@ -48,7 +48,7 @@ fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
 /// around (logs, `sample`, `vm_stat`, ...) but never modify anything. A
 /// failed diagnosis is logged, not surfaced as a notification, since the
 /// plain rule-based alert already fired.
-pub fn maybe_diagnose_alert_async(alert: &crate::alerts::Alert, snapshot_json: &str, agent_dir: &str) {
+pub fn maybe_diagnose_alert_async(alert: &crate::alerts::Alert, snapshot_json: &str, agent_dir: &str, incidents_dir: &str) {
     if !is_auto_diagnose_worthy(&alert.key) {
         return;
     }
@@ -59,16 +59,32 @@ pub fn maybe_diagnose_alert_async(alert: &crate::alerts::Alert, snapshot_json: &
          check or do next.",
         alert.message
     );
-    let title = format!("{} — agent diagnosis", alert.title);
+    let notif_title = format!("{} — agent diagnosis", alert.title);
+    let alert_key = alert.key.clone();
+    let alert_title = alert.title.clone();
+    let alert_message = alert.message.clone();
     let snapshot_json = snapshot_json.to_string();
     let agent_dir = agent_dir.to_string();
+    let incidents_dir = PathBuf::from(incidents_dir);
 
     std::thread::spawn(move || match ask(&question, &snapshot_json, &agent_dir) {
-        Ok(answer) => crate::alerts::notify(&crate::alerts::Alert {
-            key: "agent_diagnosis".to_string(),
-            title,
-            message: answer,
-        }),
+        Ok(answer) => {
+            crate::alerts::notify(&crate::alerts::Alert {
+                key: "agent_diagnosis".to_string(),
+                title: notif_title,
+                message: answer.clone(),
+            });
+
+            let incident = crate::incidents::Incident {
+                alert_key: &alert_key,
+                alert_title: &alert_title,
+                alert_message: &alert_message,
+                diagnosis: &answer,
+            };
+            if let Err(e) = crate::incidents::record(&incidents_dir, &incident) {
+                eprintln!("[vigil] failed to write incident journal entry: {e}");
+            }
+        }
         Err(e) => eprintln!("[vigil] background agent diagnosis failed: {e}"),
     });
 }

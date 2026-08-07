@@ -1,6 +1,7 @@
 mod agent;
 mod alerts;
 mod battery;
+mod incidents;
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -48,6 +49,9 @@ enum Commands {
         /// Path to the vigil_agent project directory (for CPU-alert auto-diagnosis)
         #[arg(long, default_value = "agent")]
         agent_dir: String,
+        /// Directory for the auto-diagnosis incident journal (markdown, one file per diagnosis)
+        #[arg(long, default_value_t = default_incidents_dir())]
+        incidents_dir: String,
     },
     /// Live terminal dashboard (CPU/mem sparklines + top processes)
     Ui {
@@ -66,7 +70,14 @@ enum Commands {
         /// Path to the vigil_agent project directory (for the in-UI "ask" feature)
         #[arg(long, default_value = "agent")]
         agent_dir: String,
+        /// Directory for the auto-diagnosis incident journal (markdown, one file per diagnosis)
+        #[arg(long, default_value_t = default_incidents_dir())]
+        incidents_dir: String,
     },
+}
+
+fn default_incidents_dir() -> String {
+    incidents::default_dir().to_string_lossy().to_string()
 }
 
 #[derive(Serialize)]
@@ -280,6 +291,7 @@ fn main() {
             no_notify,
             cooldown_secs,
             agent_dir,
+            incidents_dir,
         } => {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
@@ -322,7 +334,7 @@ fn main() {
                     for alert in fired {
                         eprintln!("[vigil] ALERT [{}] {}", alert.key, alert.message);
                         alerts::notify(&alert);
-                        agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir);
+                        agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir, &incidents_dir);
                     }
                 }
 
@@ -339,6 +351,7 @@ fn main() {
             no_notify,
             cooldown_secs,
             agent_dir,
+            incidents_dir,
         } => {
             let opts = ui::UiOptions {
                 interval: Duration::from_secs(interval),
@@ -346,6 +359,7 @@ fn main() {
                 notify: !no_notify,
                 cooldown: Duration::from_secs(cooldown_secs),
                 agent_dir,
+                incidents_dir,
             };
             ui::run(opts).expect("ui failed");
         }

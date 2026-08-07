@@ -9,3 +9,6 @@ agent/*.egg-info
 # vigil runtime output
 *.jsonl
 .DS_Store
+
+# personal Claude Code tooling settings, not project source
+.claude/settings.local.json

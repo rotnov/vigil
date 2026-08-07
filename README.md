@@ -24,9 +24,11 @@ without you doing it yourself.
   question right from the interface
 
 When `high_load`, `cpu_hog`, or `battery_low` fires, vigil also asks the agent to
-investigate in a background thread — non-blocking, and a follow-up notification with
-the answer once it's done. Disk and plain memory-pressure alerts don't auto-trigger the
-agent; press `a` for those.
+investigate in a background thread — non-blocking, a follow-up notification with the
+answer once it's done, and the diagnosis is saved as a markdown file in
+`~/.vigil/incidents/<date>-<time>-<slug>.md` (override with `--incidents-dir`). Disk
+and plain memory-pressure alerts don't auto-trigger the agent, and the interactive `a`
+flow is UI-only — neither writes to the incident journal.
 
 Battery ETA is a plain drain-rate extrapolation from the percentage vigil observes over
 time — there's no per-process power attribution (that needs `powermetrics
@@ -79,6 +81,9 @@ vigil (Rust)                          agent/ (Python, Claude Agent SDK)
 │   (no LLM, no network)              │                    Write/Edit + destructive Bash patterns denylisted
 ├── battery.rs — drain-rate ETA       └── cli.py        — vigil-agent ask --snapshot F --question Q
 │   (no powermetrics/sudo)
+├── incidents.rs — markdown journal
+│   for auto-diagnoses only
+│   (~/.vigil/incidents/)
 └── agent.rs — shell wrapper around
     `uv run vigil-agent ask ...`,
     plus the auto-diagnose trigger
