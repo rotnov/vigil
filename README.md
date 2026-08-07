@@ -25,7 +25,8 @@ without you doing it yourself.
   individually never rank at the top) when the group is at least 1.5x larger
 - `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes with a
   ↑/↓/→ trend arrow on memory over the last 10 samples, battery % with a drain-rate
-  ETA when discharging), `a` key — ask the agent a question right from the interface
+  ETA when discharging). `a` key — ask the agent a free-form question. `w` key —
+  ask, pre-filled, why the current #1 CPU process is using what it's using
 - `vigil incidents` — list or show saved auto-diagnoses from the terminal, without
   needing an already-open `ui` session (a TUI can't pop itself open on a push
   notification): `vigil incidents` lists recent ones, `vigil incidents --show <name>`
