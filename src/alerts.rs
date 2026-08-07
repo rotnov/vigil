@@ -79,6 +79,16 @@ pub struct Alert {
     /// `IncidentTracker`) recognize "different alert, same underlying
     /// process" without brittle text scraping.
     pub target: Option<String>,
+    /// The full command line of `target`, captured from the same `ProcInfo`
+    /// at the moment this alert fired — not re-looked-up later. A
+    /// background diagnosis (see `agent_process::maybe_diagnose_alert_async`)
+    /// runs seconds to minutes after firing, and by then the OS may have
+    /// recycled `target`'s pid to an unrelated process (observed live: an
+    /// alert named "claude" whose pid had already become a `bfs` scan by
+    /// the time the agent checked `ps -p <pid>`, see incident
+    /// 2026-08-07-14-20-56-cpu-hog-27339.md). Capturing the command here,
+    /// synchronously, at fire time avoids that race.
+    pub command: Option<String>,
 }
 
 /// Tracks whether an alert firing for a given target process is the start
@@ -144,6 +154,7 @@ impl AlertState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_fire(
         &mut self,
         now: Instant,
@@ -152,6 +163,7 @@ impl AlertState {
         title: &str,
         message: String,
         target: Option<&str>,
+        command: Option<&str>,
         out: &mut Vec<Alert>,
     ) {
         let ready = match self.last_fired.get(key) {
@@ -165,6 +177,7 @@ impl AlertState {
                 title: title.to_string(),
                 message,
                 target: target.map(str::to_string),
+                command: command.map(str::to_string),
             });
         }
     }
@@ -208,6 +221,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     snap.load_avg.one, load_threshold, cpu_count, top.name, top.cpu_pct
                 ),
                 Some(&top.name),
+                Some(&top.cmd),
                 &mut alerts,
             );
         }
@@ -226,6 +240,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     format_mem_consumer(top, &snap.top_mem_groups)
                 ),
                 Some(&top.name),
+                Some(&top.cmd),
                 &mut alerts,
             );
         }
@@ -246,6 +261,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                         format_mem_consumer(top, &snap.top_mem_groups)
                     ),
                     Some(&top.name),
+                    Some(&top.cmd),
                     &mut alerts,
                 );
             }
@@ -266,6 +282,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     disk.total_bytes as f64 / 1e9,
                     disk.used_pct
                 ),
+                None,
                 None,
                 &mut alerts,
             );
@@ -300,6 +317,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                 p.name, p.pid, p.cpu_pct, streak
             ),
             Some(&p.name),
+            Some(&p.cmd),
             &mut alerts,
         );
     }
@@ -316,6 +334,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     conn.total, conn.established, conn.time_wait, conn.close_wait
                 ),
                 None,
+                None,
                 &mut alerts,
             );
         }
@@ -330,6 +349,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     "{} external connections into a service this machine is running right now. Suggestion: `lsof -i -n -P | grep LISTEN` to see what's exposed, and confirm that's expected.",
                     conn.incoming
                 ),
+                None,
                 None,
                 &mut alerts,
             );
@@ -372,6 +392,7 @@ pub fn evaluate_battery(
     });
 
     let target = snap.top_cpu.first().map(|p| p.name.as_str());
+    let command = snap.top_cpu.first().map(|p| p.cmd.as_str());
     let mut alerts = Vec::new();
     state.try_fire(
         now,
@@ -380,6 +401,7 @@ pub fn evaluate_battery(
         "vigil: low battery",
         format!("Battery at {pct}%, discharging, ~{eta_str} remaining.{top_hint}"),
         target,
+        command,
         &mut alerts,
     );
     alerts.into_iter().next()
@@ -536,6 +558,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].key, "high_load");
         assert!(first[0].message.contains("hog"));
+        assert_eq!(first[0].command.as_deref(), Some("hog"));
 
         let second = evaluate(&snap, 4, &mut state, Duration::from_secs(300), now);
         assert!(second.is_empty(), "second call within cooldown must not re-fire");
@@ -646,6 +669,7 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].key, "low_disk:/");
         assert!(alerts[0].message.contains('%'));
+        assert_eq!(alerts[0].command, None, "disk alerts aren't about a specific process");
     }
 
     #[test]
@@ -720,6 +744,30 @@ mod tests {
         let third = evaluate(&snap, 8, &mut state, cooldown, now);
         assert_eq!(third.len(), 1, "3rd sample: streak=3, should fire");
         assert_eq!(third[0].key, "cpu_hog:99");
+    }
+
+    #[test]
+    fn cpu_hog_captures_the_process_command_line_at_fire_time() {
+        // Guards against pid-reuse misattribution in the async diagnosis
+        // (see Alert::command's doc comment and the live incident that
+        // motivated it) -- the command must be captured here, synchronously,
+        // not looked up again later by pid.
+        let mut snap = healthy_snapshot();
+        snap.top_cpu = vec![ProcInfo {
+            pid: 99,
+            name: "claude".to_string(),
+            cpu_pct: 95.0,
+            mem_bytes: 200_000_000,
+            run_time_secs: 0,
+            cmd: "bfs -S dfs / -path *".to_string(),
+        }];
+        let mut state = AlertState::new();
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(300);
+        evaluate(&snap, 8, &mut state, cooldown, now);
+        evaluate(&snap, 8, &mut state, cooldown, now);
+        let third = evaluate(&snap, 8, &mut state, cooldown, now);
+        assert_eq!(third[0].command.as_deref(), Some("bfs -S dfs / -path *"));
     }
 
     #[test]
