@@ -63,12 +63,19 @@ pub(crate) fn build_diagnosis_question(
 }
 
 /// Alert keys worth an automatic agent diagnosis: CPU spikes (by the time
-/// you'd type a question, the spike may already be gone) and low battery
+/// you'd type a question, the spike may already be gone), low battery
 /// (root-causing a drain benefits from the agent actually checking thermal
-/// state / recent high-CPU history rather than a static rule). Disk and
-/// plain memory-pressure alerts are left to the interactive 'a' flow.
+/// state / recent high-CPU history rather than a static rule), and unusually
+/// many idle instances of one process (the rule can flag the pattern, but
+/// confirming these are actually leaked/safe to kill — not e.g. a worker
+/// pool doing real, bursty background work — needs the agent to actually go
+/// look, the same way a CPU spike does). Disk and plain memory-pressure
+/// alerts are left to the interactive 'a' flow.
 pub(crate) fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
-    alert_key == "high_load" || alert_key.starts_with("cpu_hog:") || alert_key == "battery_low"
+    alert_key == "high_load"
+        || alert_key.starts_with("cpu_hog:")
+        || alert_key == "battery_low"
+        || alert_key.starts_with("high_process_count:")
 }
 
 /// A short, single-paragraph preview of a (possibly multi-paragraph)
@@ -243,6 +250,7 @@ mod tests {
         assert!(is_auto_diagnose_worthy("high_load"));
         assert!(is_auto_diagnose_worthy("cpu_hog:1234"));
         assert!(is_auto_diagnose_worthy("battery_low"));
+        assert!(is_auto_diagnose_worthy("high_process_count:node"));
     }
 
     #[test]

@@ -24,6 +24,21 @@ const RECENT_ALERTS_CAPACITY: usize = 10;
 /// tune both from real field data the way the other rules' thresholds were.
 const HIGH_CONNECTION_COUNT_THRESHOLD: u32 = 1500;
 const INCOMING_CONNECTIONS_THRESHOLD: u32 = 10;
+/// First-guess thresholds for `high_process_count`. Live incident
+/// (2026-08-07): 224 "node" processes (MCP servers spawned via `npx` by
+/// closed Claude Code/Codex/Devin sessions, never cleaned up, some 3-14
+/// days old per `ps -eo etime`) sat at 0.0% combined CPU — swap_pressure/
+/// low_memory never cited the group since its ~9.6GB never crossed
+/// GROUP_VS_SINGLE_RATIO against the single top process, and no existing
+/// rule looks at instance count at all. 100 is comfortably above every
+/// legitimately-multi-process app observed on this machine (36 Chrome
+/// renderer helpers, 80 WebKit processes) while catching the 224-instance
+/// case; 5% is "basically idle" for the group's *combined* CPU, wide
+/// enough that a real many-tab browser actually doing something (video,
+/// scroll, decode) won't false-positive. Expect to tune both from field
+/// data, same as the connection-count thresholds above.
+const PROCESS_COUNT_THRESHOLD: u32 = 100;
+const LEAKED_GROUP_CPU_IDLE_PCT: f32 = 5.0;
 /// How much bigger a process group's combined memory needs to be than the
 /// single top consumer's before a message cites the group instead — avoids
 /// e.g. citing "2 × app (210 MB combined)" when the single top process
@@ -226,6 +241,42 @@ fn format_mem_consumer(single: &ProcInfo, groups: &[ProcGroup]) -> String {
     format!("{} ({:.0} MB)", single.name, single.mem_bytes as f64 / 1e6)
 }
 
+/// Pure — a human-readable single-unit age, coarsest unit that isn't zero
+/// ("14d", "3h", "42m", "9s"). Good enough to convey "this has been running
+/// for a suspiciously long time" without pulling in a duration-formatting
+/// dependency for one alert message.
+fn format_age(secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if secs >= DAY {
+        format!("{}d", secs / DAY)
+    } else if secs >= HOUR {
+        format!("{}h", secs / HOUR)
+    } else if secs >= MINUTE {
+        format!("{}m", secs / MINUTE)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Pure — renders a `ProcGroup`'s oldest-member sample as concrete,
+/// loggable `pid (ppid X, age)` detail for `high_process_count`'s message,
+/// e.g. "pid 41181 (ppid 40723, 14d), pid 9328 (ppid 9016, 3d)". Empty if
+/// the group carried no samples (shouldn't happen for a real snapshot, but
+/// `ProcGroup::oldest` isn't a non-empty-by-construction guarantee).
+fn format_oldest_samples(group: &ProcGroup) -> String {
+    group
+        .oldest
+        .iter()
+        .map(|s| {
+            let ppid = s.ppid.map(|p| p.to_string()).unwrap_or_else(|| "none".to_string());
+            format!("pid {} (ppid {ppid}, {})", s.pid, format_age(s.run_time_secs))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Evaluate a snapshot against fixed heuristics and return any alerts that
 /// are due (i.e. not suppressed by their per-rule cooldown).
 pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, cooldown: Duration, now: Instant) -> Vec<Alert> {
@@ -379,6 +430,31 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
         }
     }
 
+    for group in &snap.top_mem_groups {
+        if group.count > PROCESS_COUNT_THRESHOLD && group.total_cpu_pct < LEAKED_GROUP_CPU_IDLE_PCT {
+            state.try_fire(
+                now,
+                cooldown,
+                &format!("high_process_count:{}", group.name),
+                "vigil: unusually many idle processes",
+                format!(
+                    "{} \"{}\" processes running, combined {:.1}% CPU (near-idle) and {:.0} MB — \
+                     looks like leaked background helpers rather than active work. Oldest: {}. \
+                     Suggestion: `ps -p <pid> -o ppid,etime,command` on one to confirm what spawned \
+                     it and whether it's safe to kill.",
+                    group.count,
+                    group.name,
+                    group.total_cpu_pct,
+                    group.total_mem_bytes as f64 / 1e6,
+                    format_oldest_samples(group)
+                ),
+                Some(&group.name),
+                None,
+                &mut alerts,
+            );
+        }
+    }
+
     alerts
 }
 
@@ -448,11 +524,12 @@ pub(crate) fn osa_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConnectionCounts, DiskInfo, LoadAvg, MemoryInfo, ProcGroup, ProcInfo, Snapshot};
+    use crate::{ConnectionCounts, DiskInfo, LoadAvg, MemoryInfo, ProcGroup, ProcInfo, ProcSample, Snapshot};
 
     fn proc(pid: u32, name: &str, cpu_pct: f32, mem_mb: u64) -> ProcInfo {
         ProcInfo {
             pid,
+            ppid: None,
             name: name.to_string(),
             cpu_pct,
             mem_bytes: mem_mb * 1_000_000,
@@ -626,6 +703,7 @@ mod tests {
             total_cpu_pct: 6.0,
             total_mem_bytes: 8_000_000_000, // 2x the single top -- over GROUP_VS_SINGLE_RATIO
             top_pid: 42,
+            oldest: vec![],
         }];
 
         let mut state = AlertState::new();
@@ -647,6 +725,7 @@ mod tests {
             total_cpu_pct: 2.0,
             total_mem_bytes: 600_000_000, // well under the single top -- no reason to prefer it
             top_pid: 42,
+            oldest: vec![],
         }];
 
         let mut state = AlertState::new();
@@ -667,6 +746,7 @@ mod tests {
             total_cpu_pct: 10.0,
             total_mem_bytes: 6_000_000_000,
             top_pid: 99,
+            oldest: vec![],
         }];
 
         let mut state = AlertState::new();
@@ -754,6 +834,94 @@ mod tests {
     }
 
     #[test]
+    fn format_age_picks_the_coarsest_nonzero_unit() {
+        assert_eq!(format_age(45), "45s");
+        assert_eq!(format_age(125), "2m");
+        assert_eq!(format_age(3 * 3600 + 61), "3h");
+        assert_eq!(format_age(14 * 86400 + 100), "14d");
+    }
+
+    #[test]
+    fn format_oldest_samples_renders_pid_ppid_and_age() {
+        let group = ProcGroup {
+            name: "node".to_string(),
+            count: 2,
+            total_cpu_pct: 0.0,
+            total_mem_bytes: 0,
+            top_pid: 1,
+            oldest: vec![
+                ProcSample { pid: 41181, ppid: Some(40723), run_time_secs: 14 * 86400 },
+                ProcSample { pid: 9328, ppid: None, run_time_secs: 3 * 86400 },
+            ],
+        };
+        let rendered = format_oldest_samples(&group);
+        assert_eq!(rendered, "pid 41181 (ppid 40723, 14d), pid 9328 (ppid none, 3d)");
+    }
+
+    #[test]
+    fn high_process_count_fires_for_a_large_idle_group_with_pid_detail() {
+        let mut snap = healthy_snapshot();
+        snap.top_mem_groups = vec![ProcGroup {
+            name: "node".to_string(),
+            count: 224,
+            total_cpu_pct: 0.0,
+            total_mem_bytes: 9_600_000_000,
+            top_pid: 67085,
+            oldest: vec![ProcSample { pid: 41181, ppid: Some(40723), run_time_secs: 14 * 86400 }],
+        }];
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].key, "high_process_count:node");
+        assert_eq!(alerts[0].target.as_deref(), Some("node"));
+        assert!(alerts[0].message.contains("224"));
+        assert!(alerts[0].message.contains("pid 41181"));
+        assert!(alerts[0].message.contains("ppid 40723"));
+        assert!(alerts[0].message.contains("14d"));
+    }
+
+    #[test]
+    fn high_process_count_ignores_a_large_group_that_is_actually_busy() {
+        // Many Chrome renderer helpers actually doing work (video, decode,
+        // scroll) shouldn't be flagged as leaked -- only a group that's
+        // both large AND collectively near-idle should.
+        let mut snap = healthy_snapshot();
+        snap.top_mem_groups = vec![ProcGroup {
+            name: "Google Chrome Helper (Renderer)".to_string(),
+            count: 150,
+            total_cpu_pct: 40.0, // well above LEAKED_GROUP_CPU_IDLE_PCT
+            total_mem_bytes: 9_000_000_000,
+            top_pid: 1,
+            oldest: vec![],
+        }];
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert!(alerts.iter().all(|a| !a.key.starts_with("high_process_count")));
+    }
+
+    #[test]
+    fn high_process_count_ignores_a_small_idle_group() {
+        // A handful of idle processes of the same name is completely
+        // normal -- only the combination of a large count AND near-zero
+        // CPU is the leak signal.
+        let mut snap = healthy_snapshot();
+        snap.top_mem_groups = vec![ProcGroup {
+            name: "helper".to_string(),
+            count: 5,
+            total_cpu_pct: 0.0,
+            total_mem_bytes: 500_000_000,
+            top_pid: 1,
+            oldest: vec![],
+        }];
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert!(alerts.iter().all(|a| !a.key.starts_with("high_process_count")));
+    }
+
+    #[test]
     fn cpu_hog_requires_sustained_streak_before_firing() {
         let mut snap = healthy_snapshot();
         snap.top_cpu = vec![proc(99, "runaway", 95.0, 200)];
@@ -778,6 +946,7 @@ mod tests {
         let mut snap = healthy_snapshot();
         snap.top_cpu = vec![ProcInfo {
             pid: 99,
+            ppid: None,
             name: "claude".to_string(),
             cpu_pct: 95.0,
             mem_bytes: 200_000_000,
