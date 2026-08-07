@@ -33,13 +33,15 @@ investigate in a background thread — non-blocking, a follow-up notification wi
 answer once it's done, and the diagnosis is saved as a markdown file in
 `~/.vigil/incidents/<date>-<time>-<slug>.md` (override with `--incidents-dir`). Disk
 and plain memory-pressure alerts don't auto-trigger the agent, and the interactive `a`
-flow is UI-only — neither writes to the incident journal. If multiple alerts name the
-same process within a couple of minutes (e.g. a `cpu_hog:<pid>` alert immediately
-followed by `high_load` for that same process), only the first spawns an
-investigation — each one is a real `uv run` + Claude Agent SDK session, so investigating
-the same root cause three times over wastes exactly the CPU/battery budget vigil
-exists to protect. A different process firing in the same window still gets its own
-investigation.
+flow is UI-only — neither writes to the incident journal.
+
+Repeat firings for the same process are treated as one ongoing incident, not a fresh
+one each time: `alerts::IncidentTracker` skips the notification, the diagnosis, and
+the journal entry for a target that already has one open (still firing within twice
+the alert cooldown of its last firing), and only starts a new incident once that
+target has been quiet for longer than that. A different process firing in the same
+window still gets its own full treatment — an incident is scoped to what it's
+actually about, not to a shared time window.
 
 Battery ETA is a plain drain-rate extrapolation from the percentage vigil observes over
 time — there's no per-process power attribution (that needs `powermetrics

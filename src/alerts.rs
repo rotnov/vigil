@@ -71,9 +71,50 @@ pub struct Alert {
     /// The process this alert is about, if any (e.g. `pycharm`) — set from
     /// the same `ProcInfo` the message text was built from, rather than
     /// parsed back out of the rendered message. Lets callers (see
-    /// `agent::DiagnosisCoalescer`) recognize "different alert, same
-    /// underlying process" without brittle text scraping.
+    /// `IncidentTracker`) recognize "different alert, same underlying
+    /// process" without brittle text scraping.
     pub target: Option<String>,
+}
+
+/// Tracks whether an alert firing for a given target process is the start
+/// of a new incident or a continuation of one still open, so a process
+/// pegged at high CPU for an hour produces one notification, one
+/// background diagnosis, and one journal entry — not a fresh one on every
+/// re-fire of the underlying rule (which, per-rule, only needs its own
+/// `cooldown` to elapse to fire again). An incident is "still open" as
+/// long as its target keeps firing within `timeout` of its last firing;
+/// once a target goes quiet for `timeout`, the next firing starts a new
+/// incident. Targetless alerts (`target: None` — e.g. `low_disk:<mount>`,
+/// `high_connection_count`) have nothing to key on and are always "new".
+///
+/// Replaces an earlier, narrower `agent::DiagnosisCoalescer` that only
+/// deduped near-simultaneous (120s) diagnoses. Real repeats of the same
+/// incident in the field arrived 5-13 minutes apart — gated by each rule's
+/// own re-fire cooldown, not by anything a 120s window could ever catch —
+/// so that mechanism never actually engaged. This subsumes it and also
+/// covers the native notification and the journal write, not just the
+/// diagnosis, since all three were spamming for the same reason.
+pub struct IncidentTracker {
+    last_seen: HashMap<String, Instant>,
+}
+
+impl IncidentTracker {
+    pub fn new() -> Self {
+        Self { last_seen: HashMap::new() }
+    }
+
+    /// Returns true if this firing should be treated as a new incident —
+    /// notify, diagnose, journal — and, either way, records `now` so the
+    /// target's open window keeps extending while it keeps firing.
+    pub fn is_new_incident(&mut self, target: Option<&str>, timeout: Duration, now: Instant) -> bool {
+        let Some(target) = target else { return true };
+        let is_new = match self.last_seen.get(target) {
+            Some(t) => now.duration_since(*t) >= timeout,
+            None => true,
+        };
+        self.last_seen.insert(target.to_string(), now);
+        is_new
+    }
 }
 
 pub struct AlertState {
@@ -655,5 +696,58 @@ mod tests {
         let ctx = recent.context_excluding("nonexistent", now).unwrap();
         assert!(!ctx.contains("msg0"), "oldest entries should have been evicted");
         assert!(ctx.contains(&format!("msg{}", RECENT_ALERTS_CAPACITY + 2)), "most recent entry must survive");
+    }
+
+    #[test]
+    fn incident_tracker_first_firing_for_a_target_is_new() {
+        let mut t = IncidentTracker::new();
+        assert!(t.is_new_incident(Some("pycharm"), Duration::from_secs(600), Instant::now()));
+    }
+
+    #[test]
+    fn incident_tracker_repeat_firing_within_timeout_is_not_new() {
+        let mut t = IncidentTracker::new();
+        let t0 = Instant::now();
+        assert!(t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0));
+        // Real field repeats arrived 5-13 minutes apart, gated by the
+        // rule's own re-fire cooldown — well inside a 600s incident window.
+        assert!(!t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0 + Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn incident_tracker_reopens_after_silence_exceeds_timeout() {
+        let mut t = IncidentTracker::new();
+        let t0 = Instant::now();
+        assert!(t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0));
+        assert!(t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0 + Duration::from_secs(900)));
+    }
+
+    #[test]
+    fn incident_tracker_extends_the_open_window_on_every_firing() {
+        let mut t = IncidentTracker::new();
+        let t0 = Instant::now();
+        assert!(t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0));
+        // Keeps firing every 5 minutes, each within the window of the last.
+        assert!(!t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0 + Duration::from_secs(300)));
+        assert!(!t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0 + Duration::from_secs(600)));
+        assert!(!t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0 + Duration::from_secs(900)));
+        // Had the window not kept extending, this point (900s after t0,
+        // but only 300s after the previous firing) would have reopened.
+    }
+
+    #[test]
+    fn incident_tracker_treats_different_targets_independently() {
+        let mut t = IncidentTracker::new();
+        let t0 = Instant::now();
+        assert!(t.is_new_incident(Some("pycharm"), Duration::from_secs(600), t0));
+        assert!(t.is_new_incident(Some("Devin Helper (Renderer)"), Duration::from_secs(600), t0));
+    }
+
+    #[test]
+    fn incident_tracker_always_new_when_target_is_unknown() {
+        let mut t = IncidentTracker::new();
+        let t0 = Instant::now();
+        assert!(t.is_new_incident(None, Duration::from_secs(600), t0));
+        assert!(t.is_new_incident(None, Duration::from_secs(600), t0));
     }
 }

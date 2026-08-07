@@ -11,8 +11,8 @@ heavier process from other projects wholesale just because it exists elsewhere.
 Everything vigil does should serve one goal: keep the machine's own performance at its
 max while on AC power, and conserve battery while on battery power. This governs
 judgment calls, not just user-facing features — vigil's *own* overhead counts against
-this goal too. `agent::DiagnosisCoalescer` exists because three redundant background
-`uv run` + Claude Agent SDK investigations for one correlated event was real CPU/token
+this goal too. `alerts::IncidentTracker` exists because repeated notifications,
+diagnoses, and journal entries for one ongoing condition was real CPU/token/attention
 cost working against exactly this goal. When evaluating a proposed change, ask whether
 it moves the machine toward or away from this, including the cost vigil itself adds.
 
@@ -96,7 +96,7 @@ it moves the machine toward or away from this, including the cost vigil itself a
 - Smaller calls (a threshold constant, a cooldown value, a struct field) don't need
   their own ADR — a clear commit message explaining the "why" is enough, consistent
   with how the live incident-driven improvement cycle has worked so far (e.g.
-  `alerts::RecentAlerts`, `agent::DiagnosisCoalescer` shipped on commit-message
+  `alerts::RecentAlerts`, `alerts::IncidentTracker` shipped on commit-message
   rationale alone, no ADR).
 
 ## The live incident-monitoring loop
@@ -116,10 +116,17 @@ it moves the machine toward or away from this, including the cost vigil itself a
   targeted vigil improvement — this is the actual mechanism this project uses to find
   bugs and gaps in itself, not a hypothetical. Verify a proposed fix against the
   *actual* field data before shipping it, not just against the pattern that motivated
-  it: a naive time-only cooldown for redundant diagnoses was rejected in favor of
-  `DiagnosisCoalescer`'s coalesce-by-target design specifically because the live
-  incident batch that motivated it also contained a genuinely independent finding a
-  time-only cooldown would have silently dropped.
+  it: an initial narrow fix (`agent::DiagnosisCoalescer`, a 120s near-simultaneous
+  window keyed by target process) was itself later found to never actually engage —
+  real repeats arrived 5-13 minutes apart, gated by each rule's own re-fire cooldown,
+  not by anything a 120s window could catch. It was replaced by
+  `alerts::IncidentTracker`, a longer open/close window (2x cooldown) keyed the same
+  way (by target process, not by time alone — the earlier design's own reasoning for
+  that part held up: the same live incident batch that motivated coalescing also
+  contained a genuinely independent finding a *time-only* cooldown would have silently
+  dropped) and covering notification + diagnosis + journal together, not diagnosis
+  alone. Re-verify a fix like this against fresh field data after shipping it, not just
+  once at design time — this project's own history is the example.
 - Never let this loop, or any alert/diagnosis path, auto-execute anything the incident
   data suggests — it stays investigate → journal → notify → (human decides). This is
   the same rule as the tool-access one above, restated because it's the thing this

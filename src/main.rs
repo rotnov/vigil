@@ -413,8 +413,13 @@ fn main() {
             let mut alert_state = alerts::AlertState::new();
             let mut battery_trend = battery::BatteryTrend::new();
             let mut recent_alerts = alerts::RecentAlerts::new();
-            let mut diagnosis_coalescer = agent::DiagnosisCoalescer::new();
+            let mut incident_tracker = alerts::IncidentTracker::new();
             let cooldown = Duration::from_secs(cooldown_secs);
+            // Wide enough that a rule cycling in and out right at its own
+            // `cooldown` boundary still reads as one ongoing incident, not
+            // several — real field repeats arrived 5-13 minutes apart,
+            // gated by cooldown itself, not by anything narrower.
+            let incident_timeout = cooldown * 2;
 
             let mut n: u64 = 0;
             loop {
@@ -448,17 +453,16 @@ fn main() {
                     }
                     for alert in fired {
                         eprintln!("[vigil] ALERT [{}] {}", alert.key, alert.message);
-                        alerts::notify(&alert);
-                        let context = recent_alerts.context_excluding(&alert.key, now);
-                        agent::maybe_diagnose_alert_async(
-                            &alert,
-                            &line,
-                            &agent_dir,
-                            &incidents_dir,
-                            context.as_deref(),
-                            &mut diagnosis_coalescer,
-                            now,
-                        );
+                        if incident_tracker.is_new_incident(alert.target.as_deref(), incident_timeout, now) {
+                            alerts::notify(&alert);
+                            let context = recent_alerts.context_excluding(&alert.key, now);
+                            agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir, &incidents_dir, context.as_deref());
+                        } else {
+                            eprintln!(
+                                "[vigil] [{}] continuing open incident for {:?} — notification/diagnosis suppressed",
+                                alert.key, alert.target
+                            );
+                        }
                     }
                 }
 
