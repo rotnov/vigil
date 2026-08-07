@@ -502,6 +502,9 @@ fn main() {
                 .append(true)
                 .open(&out)
                 .expect("failed to open output file");
+            // Absolute so the agent (a separate `uv run` subprocess) can
+            // reliably find it regardless of `--out` being relative.
+            let watch_log_path = std::fs::canonicalize(&out).ok().map(|p| p.to_string_lossy().to_string());
 
             let cpu_count = sys.cpus().len();
             let mut alert_state = alerts::AlertState::new();
@@ -550,7 +553,14 @@ fn main() {
                         if incident_tracker.is_new_incident(alert.target.as_deref(), incident_timeout, now) {
                             alerts::notify(&alert);
                             let context = recent_alerts.context_excluding(&alert.key, now);
-                            agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir, &incidents_dir, context.as_deref());
+                            agent::maybe_diagnose_alert_async(
+                                &alert,
+                                &line,
+                                &agent_dir,
+                                &incidents_dir,
+                                context.as_deref(),
+                                watch_log_path.as_deref(),
+                            );
                         } else {
                             eprintln!(
                                 "[vigil] [{}] continuing open incident for {:?} — notification/diagnosis suppressed",

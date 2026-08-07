@@ -32,6 +32,31 @@ pub fn ask(question: &str, snapshot_json: &str, agent_dir: &str) -> Result<Strin
     }
 }
 
+/// Builds the question sent to the agent for an auto-triggered diagnosis.
+/// Pure — kept separate from `maybe_diagnose_alert_async`'s side effects so
+/// the exact wording (cross-alert context, the watch-log pointer) is
+/// unit-testable without spawning anything. `watch_log_path` is `None` when
+/// the caller has no persistent JSONL history to point at (e.g. `vigil
+/// ui`'s own snapshot loop doesn't write one — only `vigil watch` does).
+fn build_diagnosis_question(alert_message: &str, recent_context: Option<&str>, watch_log_path: Option<&str>) -> String {
+    let context_note = recent_context
+        .map(|c| format!(" Other rules that also fired recently (possibly the same root cause): {c}."))
+        .unwrap_or_default();
+    let history_note = match watch_log_path {
+        Some(path) => format!(
+            " Don't just describe this one snapshot — check recent history in {path} (JSON Lines, \
+             one snapshot per line) to say whether the flagged process/metric has been growing over \
+             time or is a one-off spike, since that changes what's actually worth doing about it."
+        ),
+        None => String::new(),
+    };
+    format!(
+        "A monitoring rule just fired: \"{alert_message}\".{context_note}{history_note} Investigate \
+         the likely cause — check beyond the snapshot if useful (e.g. logs, `sample` a hot pid, \
+         thermal state) — and suggest what to check or do next."
+    )
+}
+
 /// Alert keys worth an automatic agent diagnosis: CPU spikes (by the time
 /// you'd type a question, the spike may already be gone) and low battery
 /// (root-causing a drain benefits from the agent actually checking thermal
@@ -60,6 +85,7 @@ pub fn maybe_diagnose_alert_async(
     agent_dir: &str,
     incidents_dir: &str,
     recent_context: Option<&str>,
+    watch_log_path: Option<&str>,
 ) {
     if !is_auto_diagnose_worthy(&alert.key) {
         return;
@@ -70,15 +96,7 @@ pub fn maybe_diagnose_alert_async(
         alert.key,
         recent_context.unwrap_or("(none)")
     );
-    let context_note = recent_context
-        .map(|c| format!(" Other rules that also fired recently (possibly the same root cause): {c}."))
-        .unwrap_or_default();
-    let question = format!(
-        "A monitoring rule just fired: \"{}\".{context_note} Investigate the likely cause — check \
-         beyond the snapshot if useful (e.g. logs, `sample` a hot pid, thermal state) — and suggest \
-         what to check or do next.",
-        alert.message
-    );
+    let question = build_diagnosis_question(&alert.message, recent_context, watch_log_path);
     let notif_title = format!("{} — agent diagnosis", alert.title);
     let alert_key = alert.key.clone();
     let alert_title = alert.title.clone();
@@ -170,6 +188,37 @@ fn build_args(question: &str, snapshot_path: &Path, agent_dir: &str) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_diagnosis_question_includes_the_alert_message() {
+        let q = build_diagnosis_question("pycharm has held 129% CPU", None, None);
+        assert!(q.contains("pycharm has held 129% CPU"));
+    }
+
+    #[test]
+    fn build_diagnosis_question_includes_recent_context_when_present() {
+        let q = build_diagnosis_question("high load", Some("swap is 91% full"), None);
+        assert!(q.contains("swap is 91% full"));
+    }
+
+    #[test]
+    fn build_diagnosis_question_omits_context_note_when_none() {
+        let q = build_diagnosis_question("high load", None, None);
+        assert!(!q.contains("also fired recently"));
+    }
+
+    #[test]
+    fn build_diagnosis_question_points_at_the_watch_log_when_given_a_path() {
+        let q = build_diagnosis_question("high load", None, Some("/Users/denis/.vigil/watch.jsonl"));
+        assert!(q.contains("/Users/denis/.vigil/watch.jsonl"));
+        assert!(q.contains("growing over"));
+    }
+
+    #[test]
+    fn build_diagnosis_question_omits_history_note_without_a_watch_log_path() {
+        let q = build_diagnosis_question("high load", None, None);
+        assert!(!q.contains("growing over"));
+    }
 
     #[test]
     fn build_args_wires_project_dir_snapshot_and_question() {
