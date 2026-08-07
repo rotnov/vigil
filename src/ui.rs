@@ -151,6 +151,7 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                             &opts.agent_dir,
                             &opts.incidents_dir,
                             context.as_deref(),
+                            None, // vigil ui's own snapshot loop doesn't write a persistent JSONL log
                         );
                     }
                 }
