@@ -61,6 +61,12 @@ pub struct Alert {
     pub key: String,
     pub title: String,
     pub message: String,
+    /// The process this alert is about, if any (e.g. `pycharm`) — set from
+    /// the same `ProcInfo` the message text was built from, rather than
+    /// parsed back out of the rendered message. Lets callers (see
+    /// `agent::DiagnosisCoalescer`) recognize "different alert, same
+    /// underlying process" without brittle text scraping.
+    pub target: Option<String>,
 }
 
 pub struct AlertState {
@@ -76,7 +82,16 @@ impl AlertState {
         }
     }
 
-    fn try_fire(&mut self, now: Instant, cooldown: Duration, key: &str, title: &str, message: String, out: &mut Vec<Alert>) {
+    fn try_fire(
+        &mut self,
+        now: Instant,
+        cooldown: Duration,
+        key: &str,
+        title: &str,
+        message: String,
+        target: Option<&str>,
+        out: &mut Vec<Alert>,
+    ) {
         let ready = match self.last_fired.get(key) {
             Some(t) => now.duration_since(*t) >= cooldown,
             None => true,
@@ -87,6 +102,7 @@ impl AlertState {
                 key: key.to_string(),
                 title: title.to_string(),
                 message,
+                target: target.map(str::to_string),
             });
         }
     }
@@ -109,6 +125,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     "Load average {:.1} (threshold {:.1} for {} cores). Top consumer: {} ({:.0}% CPU). Suggestion: check the process and restart it if needed.",
                     snap.load_avg.one, load_threshold, cpu_count, top.name, top.cpu_pct
                 ),
+                Some(&top.name),
                 &mut alerts,
             );
         }
@@ -127,6 +144,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     top.name,
                     top.mem_bytes as f64 / 1e6
                 ),
+                Some(&top.name),
                 &mut alerts,
             );
         }
@@ -147,6 +165,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                         top.name,
                         top.mem_bytes as f64 / 1e6
                     ),
+                    Some(&top.name),
                     &mut alerts,
                 );
             }
@@ -167,6 +186,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     disk.total_bytes as f64 / 1e9,
                     disk.used_pct
                 ),
+                None,
                 &mut alerts,
             );
         }
@@ -196,6 +216,7 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     "{} (pid {}) has held {:.0}% CPU for {} consecutive samples. Suggestion: check the process and decide whether to restart it.",
                     p.name, p.pid, p.cpu_pct, streak
                 ),
+                Some(&p.name),
                 &mut alerts,
             );
         }
@@ -236,6 +257,7 @@ pub fn evaluate_battery(
         )
     });
 
+    let target = snap.top_cpu.first().map(|p| p.name.as_str());
     let mut alerts = Vec::new();
     state.try_fire(
         now,
@@ -243,6 +265,7 @@ pub fn evaluate_battery(
         "battery_low",
         "vigil: low battery",
         format!("Battery at {pct}%, discharging, ~{eta_str} remaining.{top_hint}"),
+        target,
         &mut alerts,
     );
     alerts.into_iter().next()

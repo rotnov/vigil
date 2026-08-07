@@ -5,8 +5,56 @@
 //! whatever text comes back. All actual reasoning happens in the Python
 //! process.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+/// If two alerts about the same process fire within this window (e.g.
+/// `cpu_hog:<pid>` immediately followed by `high_load` whose top consumer
+/// is that same process), only the first spawns a background diagnosis.
+/// Wide enough to cover a burst of correlated rule-firings (observed
+/// ~35s apart in practice), narrower than the default alert
+/// re-notify cooldown (5 min) which governs repeats of one specific alert.
+const COALESCE_WINDOW: Duration = Duration::from_secs(120);
+
+/// Prevents redundant background investigations when multiple alerts name
+/// the same process in a short window — each diagnosis spawns a real `uv
+/// run` + Claude Agent SDK investigation (real CPU/token/wall-clock cost),
+/// so three near-simultaneous alerts about one process is three times the
+/// cost for one root cause. Coalescing is keyed on the *process*, not on
+/// time alone: a different process firing in the same window (e.g. a
+/// genuinely unrelated CPU hog) still gets investigated — a global
+/// time-based cooldown would have swallowed exactly that case in the field
+/// data that motivated this (2026-08-07: `cpu_hog:64955` turned out to be
+/// an independent finding, not a rediscovery of the concurrent pycharm
+/// alerts).
+pub struct DiagnosisCoalescer {
+    last_spawned: HashMap<String, Instant>,
+}
+
+impl DiagnosisCoalescer {
+    pub fn new() -> Self {
+        Self { last_spawned: HashMap::new() }
+    }
+
+    /// Returns true if a diagnosis should be spawned for `target` — and, if
+    /// so, records `now` so a subsequent call for the same target within
+    /// `window` returns false. Alerts with no identifiable target
+    /// (`target: None`) always proceed, since there's nothing to coalesce
+    /// against.
+    fn try_claim(&mut self, target: Option<&str>, window: Duration, now: Instant) -> bool {
+        let Some(target) = target else { return true };
+        let ready = match self.last_spawned.get(target) {
+            Some(t) => now.duration_since(*t) >= window,
+            None => true,
+        };
+        if ready {
+            self.last_spawned.insert(target.to_string(), now);
+        }
+        ready
+    }
+}
 
 /// Write the snapshot to a temp file, invoke the agent CLI, and return its
 /// stdout (trimmed) or an error message suitable for display in the UI.
@@ -41,24 +89,42 @@ fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
     alert_key == "high_load" || alert_key.starts_with("cpu_hog:") || alert_key == "battery_low"
 }
 
-/// If `alert` is worth it, ask the agent to investigate in a background
-/// thread and fire a follow-up notification with the answer once ready.
-/// Never blocks the caller. The agent has real (read-only) investigation
-/// tools here — same contract as the interactive 'a' flow: it can look
-/// around (logs, `sample`, `vm_stat`, ...) but never modify anything. A
-/// failed diagnosis is logged, not surfaced as a notification, since the
-/// plain rule-based alert already fired.
+/// If `alert` is worth it — and no diagnosis was already spawned for the
+/// same target process within `COALESCE_WINDOW` (see `coalescer`) — ask the
+/// agent to investigate in a background thread and fire a follow-up
+/// notification with the answer once ready. Never blocks the caller. The
+/// agent has real (read-only) investigation tools here — same contract as
+/// the interactive 'a' flow: it can look around (logs, `sample`, `vm_stat`,
+/// ...) but never modify anything. A failed diagnosis is logged, not
+/// surfaced as a notification, since the plain rule-based alert already
+/// fired.
 pub fn maybe_diagnose_alert_async(
     alert: &crate::alerts::Alert,
     snapshot_json: &str,
     agent_dir: &str,
     incidents_dir: &str,
     recent_context: Option<&str>,
+    coalescer: &mut DiagnosisCoalescer,
+    now: Instant,
 ) {
     if !is_auto_diagnose_worthy(&alert.key) {
         return;
     }
+    if !coalescer.try_claim(alert.target.as_deref(), COALESCE_WINDOW, now) {
+        eprintln!(
+            "[vigil] skipping diagnosis for [{}] — already investigating {:?} within the last {}s",
+            alert.key,
+            alert.target,
+            COALESCE_WINDOW.as_secs()
+        );
+        return;
+    }
 
+    eprintln!(
+        "[vigil] diagnosing [{}] — recent_context: {}",
+        alert.key,
+        recent_context.unwrap_or("(none)")
+    );
     let context_note = recent_context
         .map(|c| format!(" Other rules that also fired recently (possibly the same root cause): {c}."))
         .unwrap_or_default();
@@ -96,6 +162,7 @@ pub fn maybe_diagnose_alert_async(
                 key: "agent_diagnosis".to_string(),
                 title: notif_title,
                 message: format!("{}{pointer}", teaser(&answer, 180)),
+                target: None,
             });
 
             if let Err(e) = record_result {
@@ -215,5 +282,47 @@ mod tests {
         assert!(!is_auto_diagnose_worthy("low_disk:/"));
         assert!(!is_auto_diagnose_worthy("low_memory"));
         assert!(!is_auto_diagnose_worthy("swap_pressure"));
+    }
+
+    #[test]
+    fn coalescer_claims_first_call_for_a_target() {
+        let mut c = DiagnosisCoalescer::new();
+        assert!(c.try_claim(Some("pycharm"), Duration::from_secs(120), Instant::now()));
+    }
+
+    #[test]
+    fn coalescer_rejects_second_call_for_same_target_within_window() {
+        let mut c = DiagnosisCoalescer::new();
+        let t0 = Instant::now();
+        assert!(c.try_claim(Some("pycharm"), Duration::from_secs(120), t0));
+        // The high_load alert firing 35s after cpu_hog:<pid> for the same
+        // process — the exact scenario that motivated this coalescer.
+        assert!(!c.try_claim(Some("pycharm"), Duration::from_secs(120), t0 + Duration::from_secs(35)));
+    }
+
+    #[test]
+    fn coalescer_allows_same_target_again_once_window_elapses() {
+        let mut c = DiagnosisCoalescer::new();
+        let t0 = Instant::now();
+        assert!(c.try_claim(Some("pycharm"), Duration::from_secs(120), t0));
+        assert!(c.try_claim(Some("pycharm"), Duration::from_secs(120), t0 + Duration::from_secs(200)));
+    }
+
+    #[test]
+    fn coalescer_treats_different_targets_independently() {
+        let mut c = DiagnosisCoalescer::new();
+        let t0 = Instant::now();
+        assert!(c.try_claim(Some("pycharm"), Duration::from_secs(120), t0));
+        // A genuinely unrelated process (e.g. the Devin Helper finding from
+        // 2026-08-07) must still get investigated in the same window.
+        assert!(c.try_claim(Some("Devin Helper (Renderer)"), Duration::from_secs(120), t0));
+    }
+
+    #[test]
+    fn coalescer_always_claims_when_target_is_unknown() {
+        let mut c = DiagnosisCoalescer::new();
+        let t0 = Instant::now();
+        assert!(c.try_claim(None, Duration::from_secs(120), t0));
+        assert!(c.try_claim(None, Duration::from_secs(120), t0));
     }
 }

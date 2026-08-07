@@ -22,13 +22,23 @@ without you doing it yourself.
 - `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes,
   battery % with a drain-rate ETA when discharging), `a` key — ask the agent a
   question right from the interface
+- `vigil incidents` — list or show saved auto-diagnoses from the terminal, without
+  needing an already-open `ui` session (a TUI can't pop itself open on a push
+  notification): `vigil incidents` lists recent ones, `vigil incidents --show <name>`
+  prints one in full (accepts a filename or any substring that matches exactly one)
 
 When `high_load`, `cpu_hog`, or `battery_low` fires, vigil also asks the agent to
 investigate in a background thread — non-blocking, a follow-up notification with the
 answer once it's done, and the diagnosis is saved as a markdown file in
 `~/.vigil/incidents/<date>-<time>-<slug>.md` (override with `--incidents-dir`). Disk
 and plain memory-pressure alerts don't auto-trigger the agent, and the interactive `a`
-flow is UI-only — neither writes to the incident journal.
+flow is UI-only — neither writes to the incident journal. If multiple alerts name the
+same process within a couple of minutes (e.g. a `cpu_hog:<pid>` alert immediately
+followed by `high_load` for that same process), only the first spawns an
+investigation — each one is a real `uv run` + Claude Agent SDK session, so investigating
+the same root cause three times over wastes exactly the CPU/battery budget vigil
+exists to protect. A different process firing in the same window still gets its own
+investigation.
 
 Battery ETA is a plain drain-rate extrapolation from the percentage vigil observes over
 time — there's no per-process power attribution (that needs `powermetrics
@@ -60,6 +70,10 @@ Requires an installed and logged-in [Claude Code](https://claude.com/claude-code
 
 # live dashboard, ask the agent a question with 'a'
 ./target/release/vigil ui
+
+# browse past auto-diagnoses from a plain shell
+./target/release/vigil incidents
+./target/release/vigil incidents --show cpu-hog-64955
 ```
 
 ## Tests

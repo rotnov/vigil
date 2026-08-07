@@ -42,6 +42,33 @@ pub fn record(dir: &Path, incident: &Incident) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// List incident files in `dir`, oldest first (filenames sort chronologically
+/// since they're prefixed `YYYY-MM-DD-HH-MM-SS`). Empty (not an error) if the
+/// directory doesn't exist yet — a fresh install has no incidents.
+pub fn list(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read {}: {e}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+/// The first non-empty line of an incident file, stripped of its leading
+/// markdown `#` — i.e. the `alert_title` `record()` wrote as the H1.
+pub fn extract_title(content: &str) -> &str {
+    content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim_start_matches('#').trim())
+        .unwrap_or("(untitled)")
+}
+
 fn render_markdown(incident: &Incident) -> String {
     format!(
         "# {}\n\n**Alert key:** `{}`\n\n**Rule message:** {}\n\n## Agent diagnosis\n\n{}\n",
@@ -142,5 +169,37 @@ mod tests {
     fn default_dir_is_under_home() {
         let dir = default_dir();
         assert!(dir.ends_with(".vigil/incidents"));
+    }
+
+    #[test]
+    fn list_is_empty_for_missing_directory() {
+        let dir = test_dir();
+        assert!(!dir.exists());
+        assert_eq!(list(&dir).unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn list_returns_md_files_oldest_first_ignoring_other_files() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026-08-07-12-00-44-cpu-hog.md"), "x").unwrap();
+        std::fs::write(dir.join("2026-08-07-11-49-35-high-load.md"), "x").unwrap();
+        std::fs::write(dir.join(".DS_Store"), "x").unwrap();
+
+        let files = list(&dir).unwrap();
+        let names: Vec<_> = files.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, vec!["2026-08-07-11-49-35-high-load.md", "2026-08-07-12-00-44-cpu-hog.md"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_title_strips_markdown_heading() {
+        assert_eq!(extract_title("# vigil: high load\n\nbody"), "vigil: high load");
+    }
+
+    #[test]
+    fn extract_title_falls_back_when_no_content() {
+        assert_eq!(extract_title(""), "(untitled)");
     }
 }

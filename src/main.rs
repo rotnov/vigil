@@ -74,6 +74,19 @@ enum Commands {
         #[arg(long, default_value_t = default_incidents_dir())]
         incidents_dir: String,
     },
+    /// Browse the auto-diagnosis incident journal (no TUI session required)
+    Incidents {
+        /// Directory the incident journal is stored in
+        #[arg(long, default_value_t = default_incidents_dir())]
+        dir: String,
+        /// Print the full contents of one incident instead of listing —
+        /// accepts the filename, or any substring that matches exactly one
+        #[arg(long)]
+        show: Option<String>,
+        /// Max incidents to list, most recent first (ignored with --show)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 fn default_incidents_dir() -> String {
@@ -303,6 +316,7 @@ fn main() {
             let mut alert_state = alerts::AlertState::new();
             let mut battery_trend = battery::BatteryTrend::new();
             let mut recent_alerts = alerts::RecentAlerts::new();
+            let mut diagnosis_coalescer = agent::DiagnosisCoalescer::new();
             let cooldown = Duration::from_secs(cooldown_secs);
 
             let mut n: u64 = 0;
@@ -339,7 +353,15 @@ fn main() {
                         eprintln!("[vigil] ALERT [{}] {}", alert.key, alert.message);
                         alerts::notify(&alert);
                         let context = recent_alerts.context_excluding(&alert.key, now);
-                        agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir, &incidents_dir, context.as_deref());
+                        agent::maybe_diagnose_alert_async(
+                            &alert,
+                            &line,
+                            &agent_dir,
+                            &incidents_dir,
+                            context.as_deref(),
+                            &mut diagnosis_coalescer,
+                            now,
+                        );
                     }
                 }
 
@@ -368,6 +390,60 @@ fn main() {
             };
             ui::run(opts).expect("ui failed");
         }
+        Commands::Incidents { dir, show, limit } => {
+            run_incidents_command(&dir, show.as_deref(), limit);
+        }
+    }
+}
+
+/// `vigil incidents` — lists or shows saved auto-diagnosis reports so the
+/// journal can be checked from a plain shell, without an already-open TUI
+/// session (a TUI can't pop itself open on a push notification).
+fn run_incidents_command(dir: &str, show: Option<&str>, limit: usize) {
+    let path = std::path::Path::new(dir);
+    let files = incidents::list(path).unwrap_or_else(|e| {
+        eprintln!("[vigil] {e}");
+        std::process::exit(1);
+    });
+
+    if let Some(query) = show {
+        let matches: Vec<_> = files
+            .iter()
+            .filter(|p| p.file_name().unwrap().to_string_lossy().contains(query))
+            .collect();
+        match matches.as_slice() {
+            [] => {
+                eprintln!("[vigil] no incident matches \"{query}\" in {}", path.display());
+                std::process::exit(1);
+            }
+            [single] => match std::fs::read_to_string(single) {
+                Ok(content) => print!("{content}"),
+                Err(e) => {
+                    eprintln!("[vigil] failed to read {}: {e}", single.display());
+                    std::process::exit(1);
+                }
+            },
+            many => {
+                eprintln!("[vigil] \"{query}\" matches {} incidents, be more specific:", many.len());
+                for m in many {
+                    eprintln!("  {}", m.file_name().unwrap().to_string_lossy());
+                }
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if files.is_empty() {
+        println!("No incidents recorded yet in {}", path.display());
+        return;
+    }
+
+    for f in files.iter().rev().take(limit) {
+        let title = std::fs::read_to_string(f)
+            .map(|c| incidents::extract_title(&c).to_string())
+            .unwrap_or_else(|_| "(unreadable)".to_string());
+        println!("{}  {}", f.file_name().unwrap().to_string_lossy(), title);
     }
 }
 
