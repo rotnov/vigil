@@ -20,3 +20,14 @@ opt-level = "z"
 lto = true
 strip = true
 codegen-units = 1
+
+# For `samply`/flamegraph-style profiling (see README's "Profiling" section).
+# The real `--release` profile above strips symbols and optimizes for size,
+# which is right for what actually ships (see AGENTS.md's governing design
+# goal) but useless for a flamegraph -- addresses with no function names.
+# `cargo build --profile profiling` keeps release-level optimization plus
+# real symbols, without touching the default release build at all.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true
