@@ -89,6 +89,7 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.hide_cursor()?;
 
     let mut sys = System::new_all();
     let cpu_count = sys.cpus().len().max(1);
