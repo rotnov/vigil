@@ -36,6 +36,10 @@ without you doing it yourself.
   writes each tick rather than sampling on its own — see
   [docs/decisions/0002-menu-bar-health-indicator.md](docs/decisions/0002-menu-bar-health-indicator.md)
 
+Every agent answer — interactive `a` or auto-triggered — ends with a token/cost
+footer (`_Tokens: N in / M out (+K cache read) — ~$X_`), since the agent's own
+token spend is part of the overhead this project tries to keep visible, not hide.
+
 When `high_load`, `cpu_hog`, or `battery_low` fires, vigil also asks the agent to
 investigate in a background thread — non-blocking, a follow-up notification with the
 answer once it's done, and the diagnosis is saved as a markdown file in
