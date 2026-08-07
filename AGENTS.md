@@ -79,6 +79,21 @@ it moves the machine toward or away from this, including the cost vigil itself a
   function taking a `&Snapshot` plus `&mut AlertState` for cooldown/streak tracking, a
   threshold constant near the top of the file, and tests built on the file's
   `healthy_snapshot()` fixture — not a new ad hoc pattern per rule.
+- **Hard rule: 99.9% line coverage, checked with `cargo llvm-cov --workspace
+  --fail-under-lines 99.9`.** This is a merge invariant, not an aspiration — treat a
+  change that drops coverage below it the same as a failing test. As of 2026-08-07
+  this is **not yet met** (measured 73.44% — `main.rs` 37%, `agent.rs` 58%, driven by
+  `main()`'s CLI dispatch and the raw `Command`-spawning edges of
+  `read_battery`/`collect_connections`/`ask` that the "pure function split" rule above
+  keeps small but doesn't eliminate); closing that gap is tracked as ordinary project
+  work, not retroactively declared compliant. The only permitted way to fall short of
+  99.9% going forward is a documented, deliberate exemption: an inline comment on the
+  excluded region (or a whole-file `--ignore-filename-regex` entry) explaining why it
+  can't be exercised in a unit test (e.g. an OS-level side effect that would need a
+  real terminal/process/filesystem to observe) — an undocumented gap is a defect, not
+  a shrug. No coverage gate exists for `agent/`'s Python side yet; add one
+  (`pytest-cov`, same 99.9% bar) when that work happens rather than leaving it
+  Rust-only indefinitely.
 
 ## Decisions (ADRs)
 
