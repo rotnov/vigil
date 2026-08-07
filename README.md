@@ -132,6 +132,28 @@ else around them fully unit-tested) and
 [docs/decisions/0003-coverage-gate-glue-isolation.md](docs/decisions/0003-coverage-gate-glue-isolation.md)
 for the design rationale.
 
+## Profiling
+
+For when vigil itself shows up as the top consumer in its own alerts (see the
+`self_process_note` behavior above) or otherwise feels slower than it should:
+
+```bash
+brew install samply                          # no sudo/SIP dance, unlike cargo-flamegraph+dtrace on macOS
+cargo build --profile profiling              # release-level optimization, real symbols (see Cargo.toml)
+samply record -- ./target/profiling/vigil snapshot
+# or, for the steady-state loop:
+samply record -- ./target/profiling/vigil watch --count 20 --interval 1 --out /tmp/profile.jsonl
+```
+
+`samply record` opens the recorded profile in the Firefox Profiler UI in your browser
+(add `--save-only -o profile.json.gz` to just write the file instead). No `criterion`
+micro-benchmark suite — vigil's hot paths are I/O-bound shell-outs/`sysinfo` calls, not
+CPU-bound pure functions a micro-benchmark would usefully isolate, and there's no CI to
+run regression benchmarks against yet (see the Git workflow section in `AGENTS.md`);
+ad-hoc profiling when something actually feels slow is proportionate to this project's
+size. `[profile.profiling]` in `Cargo.toml` exists solely for this — it never affects
+the real `--release` build anything ships as.
+
 ## Architecture
 
 ```
