@@ -304,7 +304,7 @@ fn draw_process_table(f: &mut Frame, area: Rect, sys: &System, top_n: usize) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
-    let hint = " q/esc: quit   a: спросить агента ";
+    let hint = " q/esc: quit   a: ask agent ";
     let text = if let Some(recent) = app.alert_log.front() {
         Line::from(vec![
             Span::styled(hint, Style::default().fg(Color::DarkGray)),
@@ -344,7 +344,7 @@ fn draw_input_popup(f: &mut Frame, buffer: &str) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" спросить агента (Enter отправить, Esc отмена) ")
+                .title(" ask agent (Enter to send, Esc to cancel) ")
                 .style(Style::default().fg(Color::Cyan)),
         );
     f.render_widget(text, area);
@@ -353,7 +353,7 @@ fn draw_input_popup(f: &mut Frame, buffer: &str) {
 fn draw_thinking_popup(f: &mut Frame) {
     let area = centered_rect(40, 15, f.area());
     f.render_widget(Clear, area);
-    let text = Paragraph::new("Спрашиваю агента...").block(
+    let text = Paragraph::new("Asking the agent...").block(
         Block::default()
             .borders(Borders::ALL)
             .title(" vigil-agent ")
@@ -366,8 +366,8 @@ fn draw_answer_popup(f: &mut Frame, answer: &Result<String, String>) {
     let area = centered_rect(80, 60, f.area());
     f.render_widget(Clear, area);
     let (title, style, body) = match answer {
-        Ok(text) => (" ответ агента (Esc/Enter закрыть) ", Style::default().fg(Color::Green), text.as_str()),
-        Err(err) => (" ошибка агента (Esc/Enter закрыть) ", Style::default().fg(Color::Red), err.as_str()),
+        Ok(text) => (" agent answer (Esc/Enter to close) ", Style::default().fg(Color::Green), text.as_str()),
+        Err(err) => (" agent error (Esc/Enter to close) ", Style::default().fg(Color::Red), err.as_str()),
     };
     let text = Paragraph::new(body)
         .wrap(Wrap { trim: false })
@@ -415,7 +415,7 @@ mod tests {
         assert!(text.contains("CPU"));
         assert!(text.contains("MEM"));
         assert!(text.contains("quit"));
-        assert!(text.contains("спросить агента"));
+        assert!(text.contains("ask agent"));
     }
 
     #[test]
@@ -446,13 +446,13 @@ mod tests {
         let history = History::new();
         let mut app = AppState::new(5);
         app.input_mode = true;
-        app.input_buffer = "почему мало места?".to_string();
+        app.input_buffer = "why is disk space low?".to_string();
 
         terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("почему"));
-        assert!(text.contains("отправить"));
+        assert!(text.contains("why is disk space low?"));
+        assert!(text.contains("to send"));
     }
 
     #[test]
@@ -462,13 +462,13 @@ mod tests {
         let sys = System::new_all();
         let history = History::new();
         let mut app = AppState::new(5);
-        app.answer = Some(Ok("Диск почти полон из-за Docker".to_string()));
+        app.answer = Some(Ok("Disk is almost full because of Docker".to_string()));
 
         terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
         assert!(text.contains("Docker"));
-        assert!(text.contains("ответ агента"));
+        assert!(text.contains("agent answer"));
     }
 
     #[test]
@@ -478,13 +478,13 @@ mod tests {
         let sys = System::new_all();
         let history = History::new();
         let mut app = AppState::new(5);
-        app.answer = Some(Err("uv не найден".to_string()));
+        app.answer = Some(Err("uv not found".to_string()));
 
         terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("uv не найден"));
-        assert!(text.contains("ошибка агента"));
+        assert!(text.contains("uv not found"));
+        assert!(text.contains("agent error"));
     }
 
     #[test]
@@ -494,12 +494,12 @@ mod tests {
         let sys = System::new_all();
         let history = History::new();
         let mut app = AppState::new(5);
-        app.push_alert("[low_disk:/] мало места".to_string());
+        app.push_alert("[low_disk:/] low disk space".to_string());
 
         terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
 
         let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("мало"));
+        assert!(text.contains("low disk space"));
     }
 
     #[test]

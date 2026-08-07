@@ -37,4 +37,4 @@ async def ask(snapshot: dict[str, Any], question: str | None) -> str:
         elif isinstance(message, ResultMessage) and message.subtype == "success" and message.result:
             return message.result
 
-    return "".join(chunks).strip() or "Агент не вернул ответ."
+    return "".join(chunks).strip() or "The agent returned no answer."

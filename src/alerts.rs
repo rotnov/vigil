@@ -62,9 +62,9 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                 now,
                 cooldown,
                 "high_load",
-                "vigil: высокая нагрузка",
+                "vigil: high load",
                 format!(
-                    "Load average {:.1} (порог {:.1} для {} ядер). Главный потребитель: {} ({:.0}% CPU). Предложение: проверить и при необходимости перезапустить процесс.",
+                    "Load average {:.1} (threshold {:.1} for {} cores). Top consumer: {} ({:.0}% CPU). Suggestion: check the process and restart it if needed.",
                     snap.load_avg.one, load_threshold, cpu_count, top.name, top.cpu_pct
                 ),
                 &mut alerts,
@@ -78,9 +78,9 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                 now,
                 cooldown,
                 "swap_pressure",
-                "vigil: активный swap",
+                "vigil: active swap",
                 format!(
-                    "Своп {:.1} ГБ — памяти не хватает. Больше всего занимает: {} ({:.0} МБ). Предложение: закрыть его или перезагрузиться.",
+                    "Swap usage {:.1} GB — memory is running out. Top consumer: {} ({:.0} MB). Suggestion: close it or restart the machine.",
                     snap.memory.swap_used_bytes as f64 / 1e9,
                     top.name,
                     top.mem_bytes as f64 / 1e6
@@ -98,9 +98,9 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     now,
                     cooldown,
                     "low_memory",
-                    "vigil: мало свободной памяти",
+                    "vigil: low free memory",
                     format!(
-                        "Свободно {:.1}% памяти. Больше всего занимает: {} ({:.0} МБ). Предложение: закрыть неиспользуемые приложения.",
+                        "Only {:.1}% memory free. Top consumer: {} ({:.0} MB). Suggestion: close unused applications.",
                         free_ratio * 100.0,
                         top.name,
                         top.mem_bytes as f64 / 1e6
@@ -117,9 +117,9 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                 now,
                 cooldown,
                 &format!("low_disk:{}", disk.mount_point),
-                "vigil: мало места на диске",
+                "vigil: low disk space",
                 format!(
-                    "На {} свободно {:.1} ГБ из {:.1} ГБ ({:.0}% занято). Спроси агента 'a' в UI — почему мало места, или проверь вручную: кэши браузеров (~/Library/Caches), Docker images (docker system df), Time Machine снапшоты (tmutil listlocalsnapshots /), архивы Xcode DerivedData.",
+                    "{} has {:.1} GB free out of {:.1} GB ({:.0}% used). Press 'a' in the UI to ask the agent why, or check manually: browser caches (~/Library/Caches), Docker images (docker system df), Time Machine local snapshots (tmutil listlocalsnapshots /), Xcode DerivedData.",
                     disk.mount_point,
                     disk.available_bytes as f64 / 1e9,
                     disk.total_bytes as f64 / 1e9,
@@ -149,9 +149,9 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                 now,
                 cooldown,
                 &format!("cpu_hog:{pid}"),
-                "vigil: процесс грузит CPU",
+                "vigil: process hogging CPU",
                 format!(
-                    "{} (pid {}) держит {:.0}% CPU {} замера подряд. Предложение: проверить процесс и решить, перезапускать ли его.",
+                    "{} (pid {}) has held {:.0}% CPU for {} consecutive samples. Suggestion: check the process and decide whether to restart it.",
                     p.name, p.pid, p.cpu_pct, streak
                 ),
                 &mut alerts,

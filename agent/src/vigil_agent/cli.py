@@ -25,7 +25,7 @@ def main() -> None:
             with open(args.snapshot, encoding="utf-8") as f:
                 snapshot = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
-            print(f"не удалось прочитать снимок {args.snapshot}: {e}", file=sys.stderr)
+            print(f"failed to read snapshot {args.snapshot}: {e}", file=sys.stderr)
             sys.exit(1)
 
         answer = asyncio.run(ask(snapshot, args.question))

@@ -1,66 +1,67 @@
 # vigil
 
-Лёгкий монитор ресурсов macOS: Rust-сборщик метрик (CPU/память/своп/диски/батарея) +
-терминальный дашборд, плюс отдельный слой на [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python),
-который читает снимок и отвечает на вопросы вроде «почему тормозит» или «почему мало места на диске».
+A lightweight macOS resource monitor: a Rust metrics collector (CPU/memory/swap/disks/battery)
+with a terminal dashboard, plus a separate layer on the
+[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) that reads a
+snapshot and answers questions like "why is it slow" or "why is disk space low".
 
-Разделение осознанное: **Rust ничего не решает и не чинит** — он только дёшево снимает
-метрики (без сети, без LLM) и рисует их. Диагностика и рекомендации — отдельный
-Python-процесс, который вызывается по явному запросу пользователя (клавиша `a` в UI).
-Никаких автоматических действий над системой инструмент не выполняет.
+The split is deliberate: **Rust never decides or fixes anything** — it only cheaply
+collects metrics (no network, no LLM) and draws them. Diagnosis and recommendations are
+a separate Python process, invoked only on explicit user request (`a` key in the UI).
+The tool never takes any automatic action on the system.
 
-## Возможности
+## Features
 
-- `vigil snapshot` — один JSON-снимок в stdout (для скриптов/агента)
-- `vigil watch` — непрерывная запись снимков в JSONL + нативные macOS-уведомления
-  при обнаруженных проблемах (высокий load average, активный своп, процесс держит
-  CPU несколько замеров подряд, мало места на диске)
-- `vigil ui` — живой терминальный дашборд (sparkline CPU/MEM, топ процессов),
-  клавиша `a` — задать вопрос агенту прямо в интерфейсе
+- `vigil snapshot` — a single JSON snapshot to stdout (for scripts/the agent)
+- `vigil watch` — continuously appends snapshots to JSONL + fires native macOS
+  notifications on detected anomalies (high load average, active swap, a process
+  holding CPU for several consecutive samples, low disk space)
+- `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes),
+  `a` key — ask the agent a question right from the interface
 
-Уведомления и агент **только предлагают** — ничего не убивают и не удаляют
-автоматически.
+Notifications and the agent **only suggest** — they never kill anything or delete
+anything on their own.
 
-## Установка
+## Install
 
 ```bash
 cargo build --release
 cd agent && uv sync
 ```
 
-Требуется установленный и залогиненный [Claude Code](https://claude.com/claude-code) —
-`vigil-agent` использует его сессию, отдельный `ANTHROPIC_API_KEY` не нужен.
+Requires an installed and logged-in [Claude Code](https://claude.com/claude-code) —
+`vigil-agent` reuses its session, no separate `ANTHROPIC_API_KEY` is needed.
 
-## Использование
+## Usage
 
 ```bash
-# разовый снимок
+# one-off snapshot
 ./target/release/vigil snapshot | jq .
 
-# фоновый мониторинг с уведомлениями каждые 5 сек
+# background monitoring with notifications every 5s
 ./target/release/vigil watch --interval 5 --out vigil.jsonl
 
-# живой дашборд, вопрос агенту по клавише 'a'
+# live dashboard, ask the agent a question with 'a'
 ./target/release/vigil ui
 ```
 
-## Тесты
+## Tests
 
 ```bash
-cargo test                      # рендер UI через TestBackend, alerts, парсинг батареи
-cd agent && uv run pytest       # чистая логика построения промпта
+cargo test                      # UI rendering via TestBackend, alerts, battery parsing
+cd agent && uv run pytest       # pure prompt-building logic
 ```
 
-TUI не тестируется вручную построчно — `ratatui::backend::TestBackend` рендерит
-кадры в буфер, и тесты проверяют содержимое буфера (без реального терминала).
+The TUI isn't tested by hand — `ratatui::backend::TestBackend` renders frames into a
+buffer, and tests assert on the buffer's content without a real terminal.
 
-## Архитектура
+## Architecture
 
 ```
 vigil (Rust)                          agent/ (Python, Claude Agent SDK)
-├── snapshot/watch/ui                 ├── prompts.py   — чистое построение промпта (тестируется без сети)
-├── alerts.rs — пороговые правила     ├── diagnose.py  — query() к Claude, allowed_tools=[] (read-only v1)
-│   (без LLM, без сети)               └── cli.py       — vigil-agent ask --snapshot F --question Q
-└── agent.rs — шелл-обёртка вокруг
+├── snapshot/watch/ui                 ├── prompts.py   — pure prompt building (tested without network)
+├── alerts.rs — threshold rules       ├── diagnose.py  — query() to Claude, allowed_tools=[] (read-only v1)
+│   (no LLM, no network)              └── cli.py       — vigil-agent ask --snapshot F --question Q
+└── agent.rs — shell wrapper around
     `uv run vigil-agent ask ...`
 ```
