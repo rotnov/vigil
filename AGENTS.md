@@ -147,6 +147,21 @@ it moves the machine toward or away from this, including the cost vigil itself a
   the same rule as the tool-access one above, restated because it's the thing this
   whole feature exists to not violate.
 
+## Git workflow
+
+- Every change lands via a PR, not a direct push to `master` — create a branch, commit,
+  push, `gh pr create`. This applies even though there's currently one maintainer and
+  no required-review gate; it's for the audit trail (one PR per change, a
+  `gh pr list`/`gh pr view` history of what shipped and why), not for blocking on
+  review.
+- Auto-merge (`gh pr merge --squash`) once `cargo test --release` (and `uv run pytest`
+  if `agent/` changed) are green locally — no CI is configured yet, so "green" means
+  the local run right before merging. Don't leave a PR open waiting on a review that
+  isn't coming; that would just stall the live incident-monitoring loop for no benefit.
+- If a change needs `vigil watch`/`vigil menubar` restarted to take effect (most do),
+  do that after the merge, from the merged `master`, the same as before this workflow
+  existed — the PR step doesn't change when/how the background processes get restarted.
+
 ## Personal / machine-local config
 
 - `.claude/settings.local.json` is gitignored personal tooling config (e.g.
