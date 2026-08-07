@@ -22,7 +22,11 @@ without you doing it yourself.
   unusually high TCP connection count, or unusual incoming connections). Swap/
   memory alerts name whichever is bigger — the single top process, or a process
   *group* (every same-named instance combined, e.g. a dozen renderer helpers that
-  individually never rank at the top) when the group is at least 1.5x larger
+  individually never rank at the top) when the group is at least 1.5x larger. When a
+  CPU-related alert's own top consumer turns out to be `vigil` itself, the message
+  says so explicitly instead of reading like any other app to restart — vigil's own
+  overhead counts against the same performance goal it exists to protect, so this is
+  never hidden or excluded, just made legible when it happens
 - `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes with a
   ↑/↓/→ trend arrow on memory over the last 10 samples, battery % with a drain-rate
   ETA when discharging). `a` key — ask the agent a free-form question. `w` key —

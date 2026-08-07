@@ -30,6 +30,29 @@ const INCOMING_CONNECTIONS_THRESHOLD: u32 = 10;
 /// already dominates and the group framing would just be noise.
 const GROUP_VS_SINGLE_RATIO: f64 = 1.5;
 
+/// vigil's own compiled binary name (see `Cargo.toml`'s `[package] name`) —
+/// used to flag CPU rules where vigil itself, not something it's watching,
+/// is the cited top consumer. This matches AGENTS.md's governing design
+/// goal directly: vigil's own overhead counts against the same goal it's
+/// trying to protect, so it shouldn't be silently indistinguishable from
+/// any other process in its own alerts. Observed live (a `high_load` alert
+/// once cited "vigil (61% CPU)") — this doesn't suppress or exclude that
+/// case, it just makes it legible instead of reading like an ordinary
+/// third-party app to restart.
+const SELF_PROCESS_NAME: &str = "vigil";
+
+/// Pure — appended to a CPU-rule message when its top consumer is vigil's
+/// own process, empty otherwise.
+fn self_process_note(name: &str) -> &'static str {
+    if name == SELF_PROCESS_NAME {
+        " (this is vigil's own process, not a third-party app — if it keeps happening, \
+         it's worth profiling vigil itself rather than restarting something else; see \
+         AGENTS.md's governing design goal.)"
+    } else {
+        ""
+    }
+}
+
 /// A short rolling log of every alert that fired recently (any key,
 /// including ones that never trigger an agent diagnosis on their own —
 /// e.g. `low_memory`/`swap_pressure`). Fed to the agent as extra context
@@ -217,8 +240,8 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                 "high_load",
                 "vigil: high load",
                 format!(
-                    "Load average {:.1} (threshold {:.1} for {} cores). Top consumer: {} ({:.0}% CPU). Suggestion: check the process and restart it if needed.",
-                    snap.load_avg.one, load_threshold, cpu_count, top.name, top.cpu_pct
+                    "Load average {:.1} (threshold {:.1} for {} cores). Top consumer: {} ({:.0}% CPU).{} Suggestion: check the process and restart it if needed.",
+                    snap.load_avg.one, load_threshold, cpu_count, top.name, top.cpu_pct, self_process_note(&top.name)
                 ),
                 Some(&top.name),
                 Some(&top.cmd),
@@ -313,8 +336,8 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
             &format!("cpu_hog:{pid}"),
             "vigil: process hogging CPU",
             format!(
-                "{} (pid {}) has held {:.0}% CPU for {} consecutive samples. Suggestion: check the process and decide whether to restart it.",
-                p.name, p.pid, p.cpu_pct, streak
+                "{} (pid {}) has held {:.0}% CPU for {} consecutive samples.{} Suggestion: check the process and decide whether to restart it.",
+                p.name, p.pid, p.cpu_pct, streak, self_process_note(&p.name)
             ),
             Some(&p.name),
             Some(&p.cmd),
@@ -768,6 +791,41 @@ mod tests {
         evaluate(&snap, 8, &mut state, cooldown, now);
         let third = evaluate(&snap, 8, &mut state, cooldown, now);
         assert_eq!(third[0].command.as_deref(), Some("bfs -S dfs / -path *"));
+    }
+
+    #[test]
+    fn self_process_note_is_empty_for_a_third_party_process() {
+        assert_eq!(self_process_note("pycharm"), "");
+    }
+
+    #[test]
+    fn self_process_note_flags_vigils_own_process() {
+        assert!(self_process_note("vigil").contains("vigil's own process"));
+    }
+
+    #[test]
+    fn high_load_annotates_the_message_when_vigil_itself_is_the_top_consumer() {
+        let mut snap = healthy_snapshot();
+        snap.load_avg.one = 50.0;
+        snap.top_cpu = vec![proc(1, "vigil", 61.0, 40)];
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 4, &mut state, Duration::from_secs(300), Instant::now());
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("vigil's own process"));
+    }
+
+    #[test]
+    fn cpu_hog_annotates_the_message_when_vigil_itself_is_the_top_consumer() {
+        let mut snap = healthy_snapshot();
+        snap.top_cpu = vec![proc(1, "vigil", 95.0, 40)];
+        let mut state = AlertState::new();
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(300);
+        evaluate(&snap, 8, &mut state, cooldown, now);
+        evaluate(&snap, 8, &mut state, cooldown, now);
+        let third = evaluate(&snap, 8, &mut state, cooldown, now);
+        assert_eq!(third.len(), 1);
+        assert!(third[0].message.contains("vigil's own process"));
     }
 
     #[test]
