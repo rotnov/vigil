@@ -32,9 +32,54 @@ pub fn ask(question: &str, snapshot_json: &str, agent_dir: &str) -> Result<Strin
     }
 }
 
+/// CPU-related alert keys that are worth an automatic agent diagnosis.
+/// Disk/memory alerts already tell the user to press 'a' themselves —
+/// CPU spikes are the case where a background explanation is most useful
+/// (by the time you'd type a question, the spike may already be gone).
+fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
+    alert_key == "high_load" || alert_key.starts_with("cpu_hog:")
+}
+
+/// If `alert` is CPU-related, ask the agent to explain it in a background
+/// thread and fire a follow-up notification with the answer once ready.
+/// Never blocks the caller. Purely informational: the agent only produces
+/// text here, it never executes anything — same read-only contract as the
+/// interactive 'a' flow. A failed diagnosis is logged, not surfaced as a
+/// notification, since the plain rule-based alert already fired.
+pub fn maybe_diagnose_alert_async(alert: &crate::alerts::Alert, snapshot_json: &str, agent_dir: &str) {
+    if !is_auto_diagnose_worthy(&alert.key) {
+        return;
+    }
+
+    let question = format!(
+        "A monitoring rule just fired: \"{}\". Using only the snapshot data, explain the likely \
+         cause and suggest what to check or do next.",
+        alert.message
+    );
+    let title = format!("{} — agent diagnosis", alert.title);
+    let snapshot_json = snapshot_json.to_string();
+    let agent_dir = agent_dir.to_string();
+
+    std::thread::spawn(move || match ask(&question, &snapshot_json, &agent_dir) {
+        Ok(answer) => crate::alerts::notify(&crate::alerts::Alert {
+            key: "agent_diagnosis".to_string(),
+            title,
+            message: answer,
+        }),
+        Err(e) => eprintln!("[vigil] background agent diagnosis failed: {e}"),
+    });
+}
+
 fn temp_snapshot_path() -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("vigil-snapshot-{}.json", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Includes a nanosecond timestamp, not just the PID, because background
+    // diagnosis threads (see `diagnose_alert_async`) can call `ask()`
+    // concurrently within the same process — a PID-only name would race.
+    p.push(format!("vigil-snapshot-{}-{nanos}.json", std::process::id()));
     p
 }
 
@@ -73,5 +118,27 @@ mod tests {
     fn temp_snapshot_path_is_unique_per_process() {
         let p = temp_snapshot_path();
         assert!(p.to_string_lossy().contains(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn temp_snapshot_path_is_unique_across_concurrent_calls() {
+        // Guards against the race a PID-only filename would have with
+        // `maybe_diagnose_alert_async` spawning concurrent `ask()` calls.
+        let a = temp_snapshot_path();
+        let b = temp_snapshot_path();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn auto_diagnose_worthy_for_high_load_and_cpu_hog() {
+        assert!(is_auto_diagnose_worthy("high_load"));
+        assert!(is_auto_diagnose_worthy("cpu_hog:1234"));
+    }
+
+    #[test]
+    fn auto_diagnose_not_worthy_for_disk_and_memory_alerts() {
+        assert!(!is_auto_diagnose_worthy("low_disk:/"));
+        assert!(!is_auto_diagnose_worthy("low_memory"));
+        assert!(!is_auto_diagnose_worthy("swap_pressure"));
     }
 }

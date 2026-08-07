@@ -108,9 +108,11 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
             let (cpu_pct, mem_pct) = if due_for_alerts {
                 last_alert_check = Instant::now();
                 let snap = crate::take_snapshot(&mut sys, opts.top_n);
+                let snapshot_json = serde_json::to_string(&snap).unwrap_or_default();
                 for alert in crate::alerts::evaluate(&snap, cpu_count, &mut alert_state, opts.cooldown, Instant::now()) {
                     app.push_alert(format!("[{}] {}", alert.key, alert.message));
                     crate::alerts::notify(&alert);
+                    crate::agent::maybe_diagnose_alert_async(&alert, &snapshot_json, &opts.agent_dir);
                 }
                 (sys.global_cpu_usage(), mem_percent(&sys))
             } else {

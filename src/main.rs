@@ -44,6 +44,9 @@ enum Commands {
         /// Minimum seconds between repeat notifications for the same issue
         #[arg(long, default_value_t = 300)]
         cooldown_secs: u64,
+        /// Path to the vigil_agent project directory (for CPU-alert auto-diagnosis)
+        #[arg(long, default_value = "agent")]
+        agent_dir: String,
     },
     /// Live terminal dashboard (CPU/mem sparklines + top processes)
     Ui {
@@ -255,6 +258,7 @@ fn main() {
             top,
             no_notify,
             cooldown_secs,
+            agent_dir,
         } => {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
@@ -284,6 +288,7 @@ fn main() {
                     for alert in alerts::evaluate(&snap, cpu_count, &mut alert_state, cooldown, Instant::now()) {
                         eprintln!("[vigil] ALERT [{}] {}", alert.key, alert.message);
                         alerts::notify(&alert);
+                        agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir);
                     }
                 }
 

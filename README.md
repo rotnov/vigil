@@ -19,6 +19,11 @@ The tool never takes any automatic action on the system.
 - `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes),
   `a` key — ask the agent a question right from the interface
 
+When a CPU-related alert fires (`high_load` or a process holding CPU for 3+
+consecutive samples), vigil also asks the agent to explain it in a background
+thread — non-blocking, read-only, and a follow-up notification with the
+answer. Disk/memory alerts don't auto-trigger the agent; press `a` for those.
+
 Notifications and the agent **only suggest** — they never kill anything or delete
 anything on their own.
 
