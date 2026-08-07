@@ -253,6 +253,12 @@ fn to_proc_info(pid: &Pid, p: &sysinfo::Process) -> ProcInfo {
 }
 
 /// Shells out to `pmset -g batt` — sysinfo has no battery API on macOS.
+// Coverage exemption (see AGENTS.md's testing section): the two early
+// returns here (`pmset` failing to spawn at all; its output having fewer
+// than 2 lines) need a broken/missing `pmset` binary or PATH to trigger --
+// not reproducible without mocking `Command` on the maintainer's own Mac,
+// where it always spawns and prints its normal 2+ line format (verified by
+// `read_battery_returns_a_plausible_percentage_when_present` below).
 fn read_battery() -> Option<BatteryInfo> {
     let output = Command::new("pmset").args(["-g", "batt"]).output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout).to_string();
@@ -286,7 +292,10 @@ fn parse_battery_line(line: &str) -> Option<BatteryInfo> {
 /// discharging. Returns `None` for "0:00" (pmset's way of saying N/A when
 /// not discharging) and for "(no estimate)" right after a state change.
 fn parse_remaining_secs(line: &str) -> Option<u64> {
-    let before_remaining = line.split("remaining").next()?;
+    // `str::split` always yields at least one item (the whole string, if
+    // the pattern isn't found), so this can never be `None` -- not a
+    // defensive `?`, just how the iterator adapter is shaped.
+    let before_remaining = line.split("remaining").next().unwrap();
     let token = before_remaining.split_whitespace().last()?;
     let (h, m) = token.split_once(':')?;
     let h: u64 = h.parse().ok()?;
@@ -301,6 +310,9 @@ fn parse_remaining_secs(line: &str) -> Option<u64> {
 /// per-connection API) and classifies each TCP entry by state. See
 /// `docs/decisions/0001-network-connection-monitoring.md` for why `netstat`
 /// over `lsof`, and for the "incoming" heuristic.
+// Coverage exemption (see AGENTS.md's testing section): same reasoning as
+// `read_battery` above -- reaching either `?` here needs `netstat` itself
+// to fail to spawn.
 fn collect_connections() -> Option<ConnectionCounts> {
     let inet = Command::new("netstat").args(["-an", "-f", "inet"]).output().ok()?;
     let inet6 = Command::new("netstat").args(["-an", "-f", "inet6"]).output().ok()?;
@@ -362,7 +374,10 @@ fn parse_netstat_output(output: &str) -> ConnectionCounts {
 /// `*.61118`, or the IPv6 form `2001:8a0:616a:50.57419`) — the port is
 /// always the component after the last `.`.
 fn netstat_port(addr: &str) -> Option<&str> {
-    let port = addr.rsplit('.').next()?;
+    // `str::rsplit` always yields at least one item (the whole string, if
+    // '.' isn't found) -- never `None`, same reasoning as
+    // `parse_remaining_secs`'s equivalent `split(...).next()`.
+    let port = addr.rsplit('.').next().unwrap();
     if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
@@ -459,6 +474,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_remaining_secs_handles_nothing_before_the_word_remaining() {
+        assert_eq!(parse_remaining_secs("remaining"), None);
+    }
+
+    #[test]
+    fn parse_remaining_secs_handles_a_non_numeric_hour_or_minute() {
+        assert_eq!(parse_remaining_secs("ab:cd remaining"), None);
+        assert_eq!(parse_remaining_secs("1:cd remaining"), None);
+    }
+
+    #[test]
     fn parse_battery_line_handles_a_totally_unrecognized_line() {
         // No '%' token, no charging/discharging/AC Power keyword — pmset
         // output vigil has never actually seen, but the parser shouldn't
@@ -533,6 +559,21 @@ tcp4       0      0  127.0.0.1.9090         127.0.0.1.51000        ESTABLISHED";
     }
 
     #[test]
+    fn established_connection_with_an_unparseable_local_port_is_not_incoming() {
+        // A local address `netstat_port` can't extract a numeric port from
+        // (shouldn't happen in real `netstat` output, but the parser
+        // shouldn't panic or miscount if it ever does) is simply not
+        // matched against `listen_ports` -- not a crash, not a false count.
+        let sample = "\
+Proto Recv-Q Send-Q  Local Address                                 Foreign Address                               (state)
+tcp4       0      0  *.9090                 *.*                    LISTEN
+tcp4       0      0  malformed-local-addr   198.51.100.7.51000     ESTABLISHED";
+        let c = parse_netstat_output(sample);
+        assert_eq!(c.incoming, 0);
+        assert_eq!(c.established, 1);
+    }
+
+    #[test]
     fn netstat_port_extracts_the_trailing_port() {
         assert_eq!(netstat_port("127.0.0.1.64342"), Some("64342"));
         assert_eq!(netstat_port("*.61118"), Some("61118"));
@@ -583,11 +624,14 @@ tcp4       0      0  127.0.0.1.9090         127.0.0.1.51000        ESTABLISHED";
     }
 
     #[test]
-    fn read_battery_returns_a_plausible_percentage_when_present() {
-        // This suite only runs on the maintainer's own Mac (see AGENTS.md),
-        // which has a battery -- `pmset` is expected to succeed and parse.
-        // A silent `if let` here would let a broken `pmset` shell-out pass
-        // vacuously instead of failing loudly.
+    fn read_battery_finds_a_battery_and_a_plausible_percentage_on_this_machine() {
+        // This suite only runs on the maintainer's own MacBook (see
+        // AGENTS.md), which has a battery -- `pmset` is expected to succeed
+        // and parse. A silent `if let` here would let a broken `pmset`
+        // shell-out pass vacuously instead of failing loudly. On a desktop
+        // Mac without a battery, this test would need to change (`None` is
+        // the legitimate result there, per this function's own doc
+        // comment) -- it isn't a general-purpose assertion.
         let b = read_battery().expect("pmset -g batt should succeed and parse on this machine");
         let pct = b.percentage.expect("this machine's pmset output includes a percentage");
         assert!(pct <= 100);

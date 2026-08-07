@@ -103,6 +103,19 @@ mod tests {
     }
 
     #[test]
+    fn listing_an_unreadable_incident_shows_a_placeholder_title_not_an_error() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("2026-08-07-11-00-00-dangling.md");
+        std::os::unix::fs::symlink(dir.join("does-not-exist"), &link).unwrap();
+
+        // Listing (unlike `--show`) never fails outright on one bad entry --
+        // it prints a placeholder title and keeps going.
+        assert_eq!(run(dir.to_str().unwrap(), None, 20), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn missing_directory_lists_as_empty_not_an_error() {
         let dir = test_dir();
         assert_eq!(run(dir.to_str().unwrap(), None, 20), 0);

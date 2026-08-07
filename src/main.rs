@@ -7,6 +7,7 @@ mod incidents;
 mod incidents_cmd;
 mod menubar;
 mod menubar_loop;
+mod notify;
 mod snapshot;
 mod ui;
 mod ui_loop;

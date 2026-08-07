@@ -12,6 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// `~/.vigil/status.json` — same home-relative convention as
 /// `incidents::default_dir`, for the same reason (vigil runs from anywhere).
 pub fn default_status_file() -> PathBuf {
+    // Coverage exemption (see AGENTS.md's testing section): same reasoning
+    // as `incidents::default_dir`'s identical fallback -- `$HOME` is always
+    // set for a real `cargo test` run, and mutating it would race every
+    // other test in this same-process suite that also reads it.
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join(".vigil").join("status.json")
 }
