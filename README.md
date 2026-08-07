@@ -35,10 +35,11 @@ without you doing it yourself.
   needing an already-open `ui` session (a TUI can't pop itself open on a push
   notification): `vigil incidents` lists recent ones, `vigil incidents --show <name>`
   prints one in full (accepts a filename or any substring that matches exactly one)
-- `vigil menubar` — a macOS menu bar status item: transparent/faint when nothing's
-  open, yellow for one open incident, red for multiple. Click for a dropdown of
-  recent incidents (opens the markdown file). Polls the status file `vigil watch`
-  writes each tick rather than sampling on its own — see
+- `vigil menubar` — a macOS menu bar status item: an eye icon (drawn procedurally,
+  not a bundled asset), transparent/faint when nothing's open, yellow for one open
+  incident, red for multiple. Click for a dropdown of recent incidents (opens the
+  markdown file). Polls the status file `vigil watch` writes each tick rather than
+  sampling on its own — see
   [docs/decisions/0002-menu-bar-health-indicator.md](docs/decisions/0002-menu-bar-health-indicator.md)
 
 Every agent answer — interactive `a` or auto-triggered — ends with a token/cost

@@ -75,10 +75,40 @@ pub(crate) fn classify_health(status: Option<&StatusFile>, now_unix: u64, stale_
 
 const ICON_SIZE: u32 = 22;
 
-/// A small filled (or mostly-transparent) circle, drawn procedurally rather
-/// than loaded from a bundled asset — see the ADR. `Ok` is a faint outline
-/// rather than fully invisible pixels, so the tray item stays locatable
-/// while still reading as "nothing to see here".
+/// Two overlapping circles, centers offset vertically, produce a vesica
+/// piscis (lens) shape pointed at its left/right corners -- a horizontal
+/// almond, i.e. an eye outline. Tuned by hand against an ASCII-art render
+/// at `ICON_SIZE` (see the design commit) since there's no way to preview a
+/// rendered icon in this environment.
+const EYE_FOCAL_OFFSET: f32 = 6.5;
+const EYE_RADIUS: f32 = 9.5;
+const PUPIL_RADIUS: f32 = 2.0;
+
+/// Pure — whether the pixel center `(x, y)` falls inside the eye outline,
+/// for an icon of the given `size`. Split out from `icon_rgba` so the
+/// geometry is testable without assembling a full RGBA buffer.
+fn is_inside_eye(x: f32, y: f32, size: f32) -> bool {
+    let center = size / 2.0;
+    let d1 = ((x - center).powi(2) + (y - (center - EYE_FOCAL_OFFSET)).powi(2)).sqrt();
+    let d2 = ((x - center).powi(2) + (y - (center + EYE_FOCAL_OFFSET)).powi(2)).sqrt();
+    d1 <= EYE_RADIUS && d2 <= EYE_RADIUS
+}
+
+/// Pure — whether `(x, y)` falls inside the pupil, the small solid dot at
+/// the eye's center.
+fn is_inside_pupil(x: f32, y: f32, size: f32) -> bool {
+    let center = size / 2.0;
+    ((x - center).powi(2) + (y - center).powi(2)).sqrt() <= PUPIL_RADIUS
+}
+
+/// vigil's tray icon: a small eye — watchfulness is literally what "vigil"
+/// means — drawn procedurally rather than loaded from a bundled asset, see
+/// the ADR. `Ok` is a faint outline rather than fully invisible pixels, so
+/// the tray item stays locatable while still reading as "nothing to see
+/// here"; the pupil is drawn slightly more opaque than the rest of the eye
+/// at every health level (capped at fully opaque) for the same reason —
+/// one small anchor point that's never quite as faint as the outline
+/// around it.
 pub(crate) fn icon_rgba(level: HealthLevel) -> (Vec<u8>, u32, u32) {
     let (r, g, b, a): (u8, u8, u8, u8) = match level {
         HealthLevel::Ok => (255, 255, 255, 40),
@@ -86,20 +116,27 @@ pub(crate) fn icon_rgba(level: HealthLevel) -> (Vec<u8>, u32, u32) {
         HealthLevel::Critical => (230, 50, 50, 255),
         HealthLevel::Unknown => (140, 140, 140, 200),
     };
+    let pupil_a = a.saturating_add(30);
     let size = ICON_SIZE;
+    let size_f = size as f32;
     let mut buf = vec![0u8; (size * size * 4) as usize];
-    let center = size as f32 / 2.0;
-    let radius = size as f32 / 2.0 - 2.0;
     for y in 0..size {
         for x in 0..size {
-            let dx = x as f32 + 0.5 - center;
-            let dy = y as f32 + 0.5 - center;
-            if dx * dx + dy * dy <= radius * radius {
+            let cx = x as f32 + 0.5;
+            let cy = y as f32 + 0.5;
+            let alpha = if is_inside_pupil(cx, cy, size_f) {
+                Some(pupil_a)
+            } else if is_inside_eye(cx, cy, size_f) {
+                Some(a)
+            } else {
+                None
+            };
+            if let Some(alpha) = alpha {
                 let idx = ((y * size + x) * 4) as usize;
                 buf[idx] = r;
                 buf[idx + 1] = g;
                 buf[idx + 2] = b;
-                buf[idx + 3] = a;
+                buf[idx + 3] = alpha;
             }
         }
     }
@@ -184,11 +221,48 @@ mod tests {
     }
 
     #[test]
-    fn icon_rgba_corners_are_transparent_outside_the_circle() {
+    fn icon_rgba_corners_are_transparent_outside_the_eye() {
         let (buf, w, _h) = icon_rgba(HealthLevel::Critical);
-        // Top-left corner pixel is outside any circle inscribed in the icon.
+        // Top-left corner pixel is outside the eye shape inscribed in the icon.
         assert_eq!(buf[3], 0);
         let _ = w;
+    }
+
+    #[test]
+    fn is_inside_eye_is_wider_than_it_is_tall() {
+        let size = ICON_SIZE as f32;
+        let center = size / 2.0;
+        // A point straight out horizontally from center, within the eye's
+        // belly, should be inside; the same offset applied vertically
+        // (well past the flatter top/bottom) should not be -- confirms
+        // this reads as a horizontal almond, not a circle.
+        assert!(is_inside_eye(center + 5.0, center, size));
+        assert!(!is_inside_eye(center, center + 5.0, size));
+    }
+
+    #[test]
+    fn is_inside_pupil_is_a_small_dot_at_the_center() {
+        let size = ICON_SIZE as f32;
+        let center = size / 2.0;
+        assert!(is_inside_pupil(center, center, size));
+        assert!(!is_inside_pupil(center + 5.0, center, size));
+    }
+
+    #[test]
+    fn pupil_is_always_a_subset_of_the_eye() {
+        // The pupil should never poke outside the eye outline it sits in.
+        let size = ICON_SIZE as f32;
+        let mut y = 0.0;
+        while y < size {
+            let mut x = 0.0;
+            while x < size {
+                if is_inside_pupil(x, y, size) {
+                    assert!(is_inside_eye(x, y, size), "pupil point ({x}, {y}) escaped the eye outline");
+                }
+                x += 0.5;
+            }
+            y += 0.5;
+        }
     }
 
     #[test]
