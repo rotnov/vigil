@@ -58,6 +58,26 @@ DISALLOWED_TOOLS = [
 MAX_INVESTIGATION_TURNS = 15
 
 
+def format_usage_footer(usage: dict[str, Any] | None, cost_usd: float | None) -> str:
+    """A short, appended note on the investigation's own token spend.
+
+    Goes straight into whatever consumes `ask()`'s return value — the
+    incident journal file, the UI's answer popup — rather than a separate
+    side channel, so it's visible wherever the answer itself is. Matches
+    this project's governing design goal (vigil's own overhead, including
+    the agent's token spend, should be visible, not hidden). Returns ""
+    if no usage was ever reported (e.g. the query errored before any
+    `ResultMessage` arrived) — nothing to show is different from a zero.
+    """
+    if usage is None:
+        return ""
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cost_note = f" — ~${cost_usd:.4f}" if cost_usd is not None else ""
+    return f"\n\n---\n_Tokens: {input_tokens} in / {output_tokens} out (+{cache_read} cache read){cost_note}_"
+
+
 async def ask(snapshot: dict[str, Any], question: str | None) -> str:
     """Investigate a snapshot (and, if needed, the live system) and answer a question.
 
@@ -76,12 +96,18 @@ async def ask(snapshot: dict[str, Any], question: str | None) -> str:
     )
 
     chunks: list[str] = []
+    usage: dict[str, Any] | None = None
+    cost_usd: float | None = None
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock):
                     chunks.append(block.text)
-        elif isinstance(message, ResultMessage) and message.subtype == "success" and message.result:
-            return message.result
+        elif isinstance(message, ResultMessage):
+            usage = message.usage
+            cost_usd = message.total_cost_usd
+            if message.subtype == "success" and message.result:
+                return message.result.strip() + format_usage_footer(usage, cost_usd)
 
-    return "".join(chunks).strip() or "The agent returned no answer."
+    answer = "".join(chunks).strip() or "The agent returned no answer."
+    return answer + format_usage_footer(usage, cost_usd)
