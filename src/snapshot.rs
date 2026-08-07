@@ -15,6 +15,13 @@ use sysinfo::{Disks, Pid, System};
 #[derive(Serialize)]
 pub struct ProcInfo {
     pub pid: u32,
+    /// `None` for a process whose parent has already exited (or, rarely,
+    /// one sysinfo couldn't resolve) — on macOS a child's `ppid` still
+    /// points at its original launcher even after that launcher exits
+    /// (it becomes a live process owned by `launchd`, pid 1, only once
+    /// explicitly reparented), so this is *not* by itself a reliable
+    /// "orphaned" signal — see `alerts::high_process_count`'s doc comment.
+    pub ppid: Option<u32>,
     pub name: String,
     pub cpu_pct: f32,
     pub mem_bytes: u64,
@@ -52,6 +59,19 @@ pub struct ProcGroup {
     /// investigation (e.g. `sample <pid>`), not a claim that it alone
     /// explains the group's total.
     pub top_pid: u32,
+    /// Up to `OLDEST_SAMPLES_PER_GROUP` members of this group, oldest
+    /// first — concrete pid/ppid/age detail for `alerts::high_process_count`
+    /// to log directly, rather than an alert that just says "224 node
+    /// processes" with nothing to act on. See that rule's doc comment for
+    /// why age (not `ppid`) is the actual leaked-process signal here.
+    pub oldest: Vec<ProcSample>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ProcSample {
+    pub pid: u32,
+    pub ppid: Option<u32>,
+    pub run_time_secs: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -171,6 +191,11 @@ pub fn take_snapshot(sys: &mut System, top_n: usize) -> Snapshot {
 /// instance combined, etc. — sorted by combined memory descending. A pure
 /// function over `ProcInfo`s (not `sysinfo::Process`) so it's testable
 /// without a real `System`.
+/// How many of a group's oldest members `ProcGroup::oldest` keeps — enough
+/// to log a concrete, actionable sample without embedding an unbounded
+/// process list in every snapshot.
+const OLDEST_SAMPLES_PER_GROUP: usize = 3;
+
 fn group_by_name(procs: &[ProcInfo]) -> Vec<ProcGroup> {
     struct Acc {
         count: u32,
@@ -178,6 +203,7 @@ fn group_by_name(procs: &[ProcInfo]) -> Vec<ProcGroup> {
         total_mem_bytes: u64,
         top_pid: u32,
         top_pid_mem: u64,
+        members: Vec<ProcSample>,
     }
 
     let mut groups: std::collections::HashMap<&str, Acc> = std::collections::HashMap::new();
@@ -188,6 +214,7 @@ fn group_by_name(procs: &[ProcInfo]) -> Vec<ProcGroup> {
             total_mem_bytes: 0,
             top_pid: p.pid,
             top_pid_mem: 0,
+            members: Vec::new(),
         });
         acc.count += 1;
         acc.total_cpu_pct += p.cpu_pct;
@@ -196,16 +223,22 @@ fn group_by_name(procs: &[ProcInfo]) -> Vec<ProcGroup> {
             acc.top_pid_mem = p.mem_bytes;
             acc.top_pid = p.pid;
         }
+        acc.members.push(ProcSample { pid: p.pid, ppid: p.ppid, run_time_secs: p.run_time_secs });
     }
 
     let mut result: Vec<ProcGroup> = groups
         .into_iter()
-        .map(|(name, acc)| ProcGroup {
-            name: name.to_string(),
-            count: acc.count,
-            total_cpu_pct: acc.total_cpu_pct,
-            total_mem_bytes: acc.total_mem_bytes,
-            top_pid: acc.top_pid,
+        .map(|(name, mut acc)| {
+            acc.members.sort_by(|a, b| b.run_time_secs.cmp(&a.run_time_secs));
+            acc.members.truncate(OLDEST_SAMPLES_PER_GROUP);
+            ProcGroup {
+                name: name.to_string(),
+                count: acc.count,
+                total_cpu_pct: acc.total_cpu_pct,
+                total_mem_bytes: acc.total_mem_bytes,
+                top_pid: acc.top_pid,
+                oldest: acc.members,
+            }
         })
         .collect();
     result.sort_by(|a, b| b.total_mem_bytes.cmp(&a.total_mem_bytes));
@@ -236,6 +269,7 @@ fn collect_disks() -> Vec<DiskInfo> {
 fn to_proc_info(pid: &Pid, p: &sysinfo::Process) -> ProcInfo {
     ProcInfo {
         pid: pid.as_u32(),
+        ppid: p.parent().map(|p| p.as_u32()),
         name: p.name().to_string_lossy().to_string(),
         cpu_pct: p.cpu_usage(),
         mem_bytes: p.memory(),
@@ -394,7 +428,7 @@ mod tests {
     use super::*;
 
     fn proc(pid: u32, name: &str, cpu_pct: f32, mem_bytes: u64) -> ProcInfo {
-        ProcInfo { pid, name: name.to_string(), cpu_pct, mem_bytes, run_time_secs: 0, cmd: name.to_string() }
+        ProcInfo { pid, ppid: None, name: name.to_string(), cpu_pct, mem_bytes, run_time_secs: 0, cmd: name.to_string() }
     }
 
     #[test]
@@ -438,6 +472,31 @@ mod tests {
     #[test]
     fn group_by_name_handles_empty_input() {
         assert!(group_by_name(&[]).is_empty());
+    }
+
+    #[test]
+    fn group_by_name_tracks_the_oldest_members_of_a_large_group() {
+        let mut procs = Vec::new();
+        for i in 0..(OLDEST_SAMPLES_PER_GROUP as u32 + 5) {
+            procs.push(ProcInfo {
+                pid: 100 + i,
+                ppid: Some(1000 + i),
+                name: "node".to_string(),
+                cpu_pct: 0.0,
+                mem_bytes: 10_000_000,
+                run_time_secs: i as u64 * 3600, // later entries are older
+                cmd: "node".to_string(),
+            });
+        }
+        let groups = group_by_name(&procs);
+        let node = groups.iter().find(|g| g.name == "node").unwrap();
+
+        assert_eq!(node.oldest.len(), OLDEST_SAMPLES_PER_GROUP);
+        // Oldest (highest run_time_secs) first.
+        assert!(node.oldest.windows(2).all(|w| w[0].run_time_secs >= w[1].run_time_secs));
+        let oldest_pid = 100 + (procs.len() as u32 - 1);
+        assert_eq!(node.oldest[0].pid, oldest_pid);
+        assert_eq!(node.oldest[0].ppid, Some(1000 + (procs.len() as u32 - 1)));
     }
 
     #[test]

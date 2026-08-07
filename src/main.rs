@@ -21,7 +21,7 @@ use sysinfo::System;
 // Re-exported at the crate root so existing `crate::Snapshot`,
 // `crate::take_snapshot`, etc. references elsewhere (alerts.rs, ui.rs)
 // don't need to know the collection logic lives in `snapshot.rs`.
-pub use snapshot::{BatteryInfo, ConnectionCounts, DiskInfo, LoadAvg, MemoryInfo, ProcGroup, ProcInfo, Snapshot, take_snapshot};
+pub use snapshot::{BatteryInfo, ConnectionCounts, DiskInfo, LoadAvg, MemoryInfo, ProcGroup, ProcInfo, ProcSample, Snapshot, take_snapshot};
 
 /// Excluded from the coverage gate (see AGENTS.md's testing section): this
 /// is just `Cli::parse()` plus a delegation to whichever module actually

@@ -19,14 +19,25 @@ without you doing it yourself.
 - `vigil watch` — continuously appends snapshots to JSONL + fires native macOS
   notifications on detected anomalies (high load average, active swap, a process
   holding CPU for several consecutive samples, low disk space, low battery, an
-  unusually high TCP connection count, or unusual incoming connections). Swap/
-  memory alerts name whichever is bigger — the single top process, or a process
+  unusually high TCP connection count, unusual incoming connections, or an
+  unusually large number of near-idle instances of the same process — see below).
+  Swap/memory alerts name whichever is bigger — the single top process, or a process
   *group* (every same-named instance combined, e.g. a dozen renderer helpers that
   individually never rank at the top) when the group is at least 1.5x larger. When a
   CPU-related alert's own top consumer turns out to be `vigil` itself, the message
   says so explicitly instead of reading like any other app to restart — vigil's own
   overhead counts against the same performance goal it exists to protect, so this is
   never hidden or excluded, just made legible when it happens
+- **Leaked process detection**: a live incident found 224 `node` processes sitting at
+  0% combined CPU — MCP server subprocesses spawned by closed Claude Code/Codex/Devin
+  sessions, never cleaned up, some over a week old. `high_process_count` fires when a
+  process group is both unusually large *and* collectively near-idle (a real busy
+  multi-process workload, like a browser with many active tabs, won't match both at
+  once) and names concrete `pid (ppid X, age)` samples of the group's oldest members
+  in the message — not just a count — so there's something to actually check before
+  deciding whether to kill anything. Auto-triggers an agent investigation, same as
+  `cpu_hog`. See
+  [docs/decisions/0004-leaked-process-detection.md](docs/decisions/0004-leaked-process-detection.md)
 - `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes with a
   ↑/↓/→ trend arrow on memory over the last 10 samples, battery % with a drain-rate
   ETA when discharging). `a` key — ask the agent a free-form question. `w` key —
