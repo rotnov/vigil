@@ -23,9 +23,9 @@ without you doing it yourself.
   memory alerts name whichever is bigger — the single top process, or a process
   *group* (every same-named instance combined, e.g. a dozen renderer helpers that
   individually never rank at the top) when the group is at least 1.5x larger
-- `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes,
-  battery % with a drain-rate ETA when discharging), `a` key — ask the agent a
-  question right from the interface
+- `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes with a
+  ↑/↓/→ trend arrow on memory over the last 10 samples, battery % with a drain-rate
+  ETA when discharging), `a` key — ask the agent a question right from the interface
 - `vigil incidents` — list or show saved auto-diagnoses from the terminal, without
   needing an already-open `ui` session (a TUI can't pop itself open on a push
   notification): `vigil incidents` lists recent ones, `vigil incidents --show <name>`
