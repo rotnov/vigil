@@ -77,38 +77,70 @@ const ICON_SIZE: u32 = 22;
 
 /// Two overlapping circles, centers offset vertically, produce a vesica
 /// piscis (lens) shape pointed at its left/right corners -- a horizontal
-/// almond, i.e. an eye outline. Tuned by hand against an ASCII-art render
-/// at `ICON_SIZE` (see the design commit) since there's no way to preview a
-/// rendered icon in this environment.
+/// almond, i.e. an eye outline. Tuned by hand against actual rendered PNG
+/// previews at `ICON_SIZE` (see the design commit) since there's no way to
+/// preview a rendered icon directly in this environment — a throwaway test
+/// dumped the RGBA buffers to a file, rendered with Pillow, viewed as an
+/// image. A first pass without anti-aliasing read as an angular hexagon
+/// rather than a smooth almond at this resolution, and a same-hue pupil
+/// (just a higher-alpha version of the eye's own color) was too subtle to
+/// register as a pupil at all — both addressed below.
 const EYE_FOCAL_OFFSET: f32 = 6.5;
 const EYE_RADIUS: f32 = 9.5;
-const PUPIL_RADIUS: f32 = 2.0;
+const PUPIL_RADIUS: f32 = 2.6;
+/// How far the pupil's RGB is mixed toward black, relative to the eye's own
+/// color — real contrast instead of an alpha bump, which barely reads at
+/// `ICON_SIZE`.
+const PUPIL_DARKEN: f32 = 0.65;
 
-/// Pure — whether the pixel center `(x, y)` falls inside the eye outline,
-/// for an icon of the given `size`. Split out from `icon_rgba` so the
-/// geometry is testable without assembling a full RGBA buffer.
-fn is_inside_eye(x: f32, y: f32, size: f32) -> bool {
+/// Pure — signed-distance-ish coverage (0.0 outside, 1.0 solidly inside,
+/// a ~1px soft transition between) for the eye outline at `(x, y)` on an
+/// icon of the given `size`. Anti-aliasing this instead of a hard boolean
+/// test is what turns the two-circle intersection into a smooth almond
+/// instead of a blocky hexagon at 22px.
+fn eye_coverage(x: f32, y: f32, size: f32) -> f32 {
     let center = size / 2.0;
     let d1 = ((x - center).powi(2) + (y - (center - EYE_FOCAL_OFFSET)).powi(2)).sqrt();
     let d2 = ((x - center).powi(2) + (y - (center + EYE_FOCAL_OFFSET)).powi(2)).sqrt();
-    d1 <= EYE_RADIUS && d2 <= EYE_RADIUS
+    (EYE_RADIUS - d1).min(EYE_RADIUS - d2).clamp(-0.5, 0.5) + 0.5
 }
 
-/// Pure — whether `(x, y)` falls inside the pupil, the small solid dot at
-/// the eye's center.
-fn is_inside_pupil(x: f32, y: f32, size: f32) -> bool {
+/// Pure — coverage (see `eye_coverage`) for the pupil, the small dot at the
+/// eye's center.
+fn pupil_coverage(x: f32, y: f32, size: f32) -> f32 {
     let center = size / 2.0;
-    ((x - center).powi(2) + (y - center).powi(2)).sqrt() <= PUPIL_RADIUS
+    let d = ((x - center).powi(2) + (y - center).powi(2)).sqrt();
+    (PUPIL_RADIUS - d).clamp(-0.5, 0.5) + 0.5
+}
+
+/// Whether the pixel center `(x, y)` falls at least partly inside the eye
+/// outline. A boolean view of `eye_coverage`, only for tests that want
+/// in/out rather than the anti-aliasing weight `icon_rgba` itself uses.
+#[cfg(test)]
+fn is_inside_eye(x: f32, y: f32, size: f32) -> bool {
+    eye_coverage(x, y, size) > 0.0
+}
+
+/// Whether `(x, y)` falls at least partly inside the pupil — test-only,
+/// see `is_inside_eye`.
+#[cfg(test)]
+fn is_inside_pupil(x: f32, y: f32, size: f32) -> bool {
+    pupil_coverage(x, y, size) > 0.0
+}
+
+fn lerp_u8(from: u8, to: u8, t: f32) -> u8 {
+    (from as f32 + (to as f32 - from as f32) * t.clamp(0.0, 1.0)).round() as u8
 }
 
 /// vigil's tray icon: a small eye — watchfulness is literally what "vigil"
 /// means — drawn procedurally rather than loaded from a bundled asset, see
 /// the ADR. `Ok` is a faint outline rather than fully invisible pixels, so
 /// the tray item stays locatable while still reading as "nothing to see
-/// here"; the pupil is drawn slightly more opaque than the rest of the eye
-/// at every health level (capped at fully opaque) for the same reason —
-/// one small anchor point that's never quite as faint as the outline
-/// around it.
+/// here". The pupil is mixed toward black (not just a higher alpha) for
+/// real contrast against the eye's health-color body at every level,
+/// including `Ok` — a small darker dot inside an otherwise near-invisible
+/// shape still reads as unobtrusive, not as a second thing demanding
+/// attention.
 pub(crate) fn icon_rgba(level: HealthLevel) -> (Vec<u8>, u32, u32) {
     let (r, g, b, a): (u8, u8, u8, u8) = match level {
         HealthLevel::Ok => (255, 255, 255, 40),
@@ -116,7 +148,7 @@ pub(crate) fn icon_rgba(level: HealthLevel) -> (Vec<u8>, u32, u32) {
         HealthLevel::Critical => (230, 50, 50, 255),
         HealthLevel::Unknown => (140, 140, 140, 200),
     };
-    let pupil_a = a.saturating_add(30);
+    let (pr, pg, pb) = (lerp_u8(r, 0, PUPIL_DARKEN), lerp_u8(g, 0, PUPIL_DARKEN), lerp_u8(b, 0, PUPIL_DARKEN));
     let size = ICON_SIZE;
     let size_f = size as f32;
     let mut buf = vec![0u8; (size * size * 4) as usize];
@@ -124,20 +156,16 @@ pub(crate) fn icon_rgba(level: HealthLevel) -> (Vec<u8>, u32, u32) {
         for x in 0..size {
             let cx = x as f32 + 0.5;
             let cy = y as f32 + 0.5;
-            let alpha = if is_inside_pupil(cx, cy, size_f) {
-                Some(pupil_a)
-            } else if is_inside_eye(cx, cy, size_f) {
-                Some(a)
-            } else {
-                None
-            };
-            if let Some(alpha) = alpha {
-                let idx = ((y * size + x) * 4) as usize;
-                buf[idx] = r;
-                buf[idx + 1] = g;
-                buf[idx + 2] = b;
-                buf[idx + 3] = alpha;
+            let eye_cov = eye_coverage(cx, cy, size_f);
+            if eye_cov <= 0.0 {
+                continue;
             }
+            let pupil_t = pupil_coverage(cx, cy, size_f).clamp(0.0, 1.0);
+            let idx = ((y * size + x) * 4) as usize;
+            buf[idx] = lerp_u8(r, pr, pupil_t);
+            buf[idx + 1] = lerp_u8(g, pg, pupil_t);
+            buf[idx + 2] = lerp_u8(b, pb, pupil_t);
+            buf[idx + 3] = (a as f32 * eye_cov.clamp(0.0, 1.0)).round() as u8;
         }
     }
     (buf, size, size)
