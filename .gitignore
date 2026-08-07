@@ -5,6 +5,8 @@ agent/.venv
 **/__pycache__
 *.pyc
 agent/*.egg-info
+agent/.coverage
+agent/.pytest_cache
 
 # vigil runtime output
 *.jsonl

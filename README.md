@@ -105,34 +105,52 @@ Requires an installed and logged-in [Claude Code](https://claude.com/claude-code
 ## Tests
 
 ```bash
-cargo test                      # UI rendering via TestBackend, alerts, battery trend/parsing
-cd agent && uv run pytest       # prompt building + the tool-access safety rails
+cargo llvm-cov --workspace --ignore-filename-regex 'src/(main|watch|ui_loop|menubar_loop|agent_process|notify)\.rs' \
+  --fail-under-lines 99.5 --fail-under-regions 98
+cd agent && uv run pytest       # prompt building, the tool-access safety rails, cov-fail-under=99.9
 ```
 
 The TUI isn't tested by hand — `ratatui::backend::TestBackend` renders frames into a
-buffer, and tests assert on the buffer's content without a real terminal.
+buffer, and tests assert on the buffer's content without a real terminal. See
+`AGENTS.md`'s testing section for why line coverage is measured with that
+`--ignore-filename-regex` (six files are genuine OS-boundary glue — a real terminal
+event loop, a real macOS menu bar event loop, a real process spawn — with everything
+else around them fully unit-tested) and
+[docs/decisions/0003-coverage-gate-glue-isolation.md](docs/decisions/0003-coverage-gate-glue-isolation.md)
+for the design rationale.
 
 ## Architecture
 
 ```
-vigil (Rust)                          agent/ (Python, Claude Agent SDK)
-├── snapshot/watch/ui                 ├── prompts.py    — pure prompt building (tested without network)
-├── alerts.rs — threshold rules       ├── diagnose.py   — query() to Claude: Bash/Read/Grep/Glob allowed,
-│   (no LLM, no network)              │                    Write/Edit + destructive Bash patterns denylisted
-├── battery.rs — drain-rate ETA       └── cli.py        — vigil-agent ask --snapshot F --question Q
+vigil (Rust)                            agent/ (Python, Claude Agent SDK)
+├── cli.rs — clap arg definitions       ├── prompts.py    — pure prompt building (tested without network)
+├── snapshot.rs — snapshot collection,  ├── diagnose.py   — query() to Claude: Bash/Read/Grep/Glob allowed,
+│   incl. connections via `netstat`     │                    Write/Edit + destructive Bash patterns denylisted
+│   (see docs/decisions/0001)           └── cli.py        — vigil-agent ask --snapshot F --question Q
+├── alerts.rs — threshold rules
+│   (no LLM, no network)
+├── battery.rs — drain-rate ETA
 │   (no powermetrics/sudo)
 ├── incidents.rs — markdown journal
 │   for auto-diagnoses only
 │   (~/.vigil/incidents/)
-├── main.rs — snapshot collection,
-│   incl. connection counts via
-│   `netstat` (see docs/decisions/0001)
-├── agent.rs — shell wrapper around
-│   `uv run vigil-agent ask ...`,
-│   plus the auto-diagnose trigger
-└── menubar.rs — tray icon, polls the
-    status file `watch` writes each
-    tick (see docs/decisions/0002)
+├── incidents_cmd.rs — `vigil incidents`
+├── agent.rs — question/arg building,
+│   output parsing (pure, unit-tested)
+├── menubar.rs — health classification,
+│   icon rendering (pure, unit-tested)
+├── watch.rs — the `vigil watch` loop
+│   (OS-boundary glue, see ADR-0003)
+├── ui_loop.rs — the `vigil ui` terminal
+│   event loop (OS-boundary glue)
+├── menubar_loop.rs — the real macOS
+│   tray/menu event loop (OS-boundary)
+├── agent_process.rs — the actual
+│   `uv run vigil-agent` spawn (OS-boundary)
+├── notify.rs — the actual `osascript`
+│   shell-out (OS-boundary)
+└── main.rs — Cli::parse() + dispatch
+    to the module owning each subcommand
 ```
 
 Project-wide design decisions with a real alternative (a parsing strategy, an alert

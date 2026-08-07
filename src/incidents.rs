@@ -15,6 +15,10 @@ use std::process::Command;
 pub fn default_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
+        // Coverage exemption (see AGENTS.md's testing section): a real
+        // `cargo test` process always has `$HOME` set, and mutating a
+        // shared env var from a test would race every other test in this
+        // (multi-threaded, same-process) suite that also reads it.
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".vigil").join("incidents")
 }
@@ -36,6 +40,10 @@ pub fn record(dir: &Path, incident: &Incident) -> Result<PathBuf, String> {
 
     let body = render_markdown(incident);
     let mut f = std::fs::File::create(&path).map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+    // Coverage exemption (see AGENTS.md's testing section): triggering a
+    // write failure on an already-successfully-created file needs a fault
+    // (disk full, quota, revoked permissions mid-write) that isn't
+    // reasonably reproducible from a unit test.
     f.write_all(body.as_bytes())
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
 
@@ -99,6 +107,11 @@ fn timestamp_prefix() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        // Coverage exemption (see AGENTS.md's testing section): reaching
+        // this fallback needs the system `date` binary itself to be
+        // missing or broken, which isn't something to fake from a test
+        // without mocking `Command` (the exact thing this file's pure/IO
+        // split is meant to avoid needing).
         .unwrap_or_else(|| "unknown-time".to_string())
 }
 
@@ -135,11 +148,7 @@ mod tests {
 
         let path = record(&dir, &incident).unwrap();
         assert!(path.exists());
-        assert!(
-            path.file_name().unwrap().to_string_lossy().ends_with("-high-load.md"),
-            "unexpected filename: {:?}",
-            path.file_name()
-        );
+        assert!(path.file_name().unwrap().to_string_lossy().ends_with("-high-load.md"));
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("vigil: high load"));
@@ -163,6 +172,45 @@ mod tests {
         record(&dir, &incident).unwrap();
         assert!(dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_fails_when_the_incidents_dir_cannot_be_created() {
+        let parent = test_dir();
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut perms = std::fs::metadata(&parent).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&parent, perms).unwrap();
+
+        let dir = parent.join("cant-create-this");
+        let incident = Incident { alert_key: "k", alert_title: "t", alert_message: "m", diagnosis: "d" };
+        let result = record(&dir, &incident);
+
+        let mut writable = std::fs::metadata(&parent).unwrap().permissions();
+        writable.set_readonly(false);
+        std::fs::set_permissions(&parent, writable).unwrap();
+        let _ = std::fs::remove_dir_all(&parent);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn record_fails_when_the_file_cannot_be_created() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let incident = Incident { alert_key: "k", alert_title: "t", alert_message: "m", diagnosis: "d" };
+        let result = record(&dir, &incident);
+
+        let mut writable = std::fs::metadata(&dir).unwrap().permissions();
+        writable.set_readonly(false);
+        std::fs::set_permissions(&dir, writable).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(result.is_err());
     }
 
     #[test]

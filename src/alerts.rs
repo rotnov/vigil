@@ -286,20 +286,22 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
         .iter()
         .find(|(_, &s)| s >= CPU_HOG_STREAK_REQUIRED)
     {
-        if let Some(p) = snap.top_cpu.iter().find(|p| p.pid == pid) {
-            state.try_fire(
-                now,
-                cooldown,
-                &format!("cpu_hog:{pid}"),
-                "vigil: process hogging CPU",
-                format!(
-                    "{} (pid {}) has held {:.0}% CPU for {} consecutive samples. Suggestion: check the process and decide whether to restart it.",
-                    p.name, p.pid, p.cpu_pct, streak
-                ),
-                Some(&p.name),
-                &mut alerts,
-            );
-        }
+        // `retain` above already dropped every streak entry whose pid isn't
+        // in `snap.top_cpu` for this snapshot, so a surviving entry here is
+        // always findable -- not a defensive `if let`, a real guarantee.
+        let p = snap.top_cpu.iter().find(|p| p.pid == pid).expect("streak retain() guarantees this pid is in top_cpu");
+        state.try_fire(
+            now,
+            cooldown,
+            &format!("cpu_hog:{pid}"),
+            "vigil: process hogging CPU",
+            format!(
+                "{} (pid {}) has held {:.0}% CPU for {} consecutive samples. Suggestion: check the process and decide whether to restart it.",
+                p.name, p.pid, p.cpu_pct, streak
+            ),
+            Some(&p.name),
+            &mut alerts,
+        );
     }
 
     if let Some(conn) = &snap.connections {
@@ -383,26 +385,17 @@ pub fn evaluate_battery(
     alerts.into_iter().next()
 }
 
-/// Fire a native macOS notification. Purely informational — never runs any
-/// remediation itself. The user acts on the suggestion manually (or, in a
-/// future agent-driven mode, only after explicit confirmation).
-pub fn notify(alert: &Alert) {
-    let script = format!(
-        "display notification {} with title {} sound name \"Glass\"",
-        osa_quote(&alert.message),
-        osa_quote(&alert.title)
-    );
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output();
-}
+// `notify` (the actual `osascript` shell-out) lives in `notify.rs`, a
+// dedicated, coverage-gate-excluded file — see that file's doc comment for
+// why. Re-exported here so `crate::alerts::notify` keeps working everywhere
+// it's already called.
+pub use crate::notify::notify;
 
 /// Quotes a string for a single-line `osascript -e` argument. Also
 /// collapses newlines to spaces — a literal `\n` would terminate the `-e`
 /// script mid-statement (unterminated string literal), which is a real risk
 /// here since agent diagnoses are multi-paragraph text.
-fn osa_quote(s: &str) -> String {
+pub(crate) fn osa_quote(s: &str) -> String {
     let single_line = s.replace(['\n', '\r'], " ");
     format!("\"{}\"", single_line.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -463,10 +456,72 @@ mod tests {
     }
 
     #[test]
+    fn zero_total_memory_does_not_panic_or_fire_low_memory() {
+        // Guards the `total_bytes > 0` check that avoids a division by zero
+        // computing `free_ratio` -- a real `Snapshot` should never have a
+        // zero total, but a malformed/future one shouldn't crash `evaluate`.
+        let mut snap = healthy_snapshot();
+        snap.memory.total_bytes = 0;
+        snap.memory.free_bytes = 0;
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert!(alerts.iter().all(|a| a.key != "low_memory"));
+    }
+
+    #[test]
     fn healthy_system_produces_no_alerts() {
         let mut state = AlertState::new();
         let alerts = evaluate(&healthy_snapshot(), 8, &mut state, Duration::from_secs(300), Instant::now());
         assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn high_load_with_no_top_cpu_process_does_not_panic_or_fire() {
+        // `top_cpu` isn't guaranteed non-empty by anything -- `evaluate`
+        // takes an arbitrary `Snapshot` -- so a threshold breach with
+        // nothing to name as the top consumer must be a no-op, not a panic.
+        let mut snap = healthy_snapshot();
+        snap.load_avg.one = 100.0;
+        snap.top_cpu = vec![];
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert!(alerts.iter().all(|a| a.key != "high_load"));
+    }
+
+    #[test]
+    fn swap_pressure_with_no_top_mem_process_does_not_panic_or_fire() {
+        let mut snap = healthy_snapshot();
+        snap.memory.swap_used_bytes = SWAP_THRESHOLD_BYTES + 1;
+        snap.top_mem = vec![];
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert!(alerts.iter().all(|a| a.key != "swap_pressure"));
+    }
+
+    #[test]
+    fn low_memory_with_no_top_mem_process_does_not_panic_or_fire() {
+        let mut snap = healthy_snapshot();
+        snap.memory.free_bytes = 1; // well under LOW_FREE_MEM_RATIO of total_bytes
+        snap.top_mem = vec![];
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert!(alerts.iter().all(|a| a.key != "low_memory"));
+    }
+
+    #[test]
+    fn evaluate_battery_is_none_without_a_battery_reading() {
+        let mut snap = healthy_snapshot();
+        snap.battery = None;
+        let mut state = AlertState::new();
+        assert!(evaluate_battery(&snap, None, &mut state, Duration::from_secs(300), Instant::now()).is_none());
+    }
+
+    #[test]
+    fn evaluate_battery_is_none_when_discharging_without_a_percentage() {
+        let mut snap = healthy_snapshot();
+        snap.battery = Some(crate::BatteryInfo { percentage: None, charging: Some(false), remaining_secs: None, raw: "test".to_string() });
+        let mut state = AlertState::new();
+        assert!(evaluate_battery(&snap, None, &mut state, Duration::from_secs(300), Instant::now()).is_none());
     }
 
     #[test]
@@ -734,6 +789,15 @@ mod tests {
         )
         .unwrap();
         assert!(alert.message.contains("42m"));
+    }
+
+    #[test]
+    fn low_battery_falls_back_to_unknown_eta_when_neither_source_has_one() {
+        let mut snap = healthy_snapshot();
+        snap.battery = Some(battery(10, Some(false), None)); // no pmset remaining_secs either
+        let mut state = AlertState::new();
+        let alert = evaluate_battery(&snap, None, &mut state, Duration::from_secs(300), Instant::now()).unwrap();
+        assert!(alert.message.contains("unknown"));
     }
 
     #[test]

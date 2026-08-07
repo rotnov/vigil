@@ -89,6 +89,31 @@ mod tests {
     }
 
     #[test]
+    fn record_caps_at_max_samples_dropping_the_oldest() {
+        let mut t = BatteryTrend::new();
+        let now = Instant::now();
+        // Push well past MAX_SAMPLES -- the ring buffer should stay capped
+        // and keep tracking the most recent window, not grow unbounded.
+        for i in 0..(MAX_SAMPLES as u64 + 10) {
+            t.record(Some(false), Some(100u8.saturating_sub(i as u8)), now + Duration::from_secs(i * 60));
+        }
+        assert_eq!(t.samples.len(), MAX_SAMPLES);
+        assert!(t.eta().is_some());
+    }
+
+    #[test]
+    fn eta_is_none_when_samples_share_the_same_instant() {
+        // Guards the elapsed_secs <= 0.0 branch -- a zero-duration window
+        // can't yield a meaningful drain rate.
+        let mut t = BatteryTrend::new();
+        let now = Instant::now();
+        for pct in [90, 89, 88] {
+            t.record(Some(false), Some(pct), now);
+        }
+        assert!(t.eta().is_none());
+    }
+
+    #[test]
     fn no_eta_while_charging() {
         let mut t = BatteryTrend::new();
         let now = Instant::now();

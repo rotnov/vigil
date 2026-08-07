@@ -18,4 +18,27 @@ build-backend = "hatchling.build"
 packages = ["src/vigil_agent"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=7.1.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov=vigil_agent --cov-report=term-missing --cov-fail-under=99.9"
+
+[tool.coverage.run]
+# `cli.py` is the entry point: argparse + a real `asyncio.run(ask(...))`
+# call into the Claude Agent SDK -- same category as `main.rs` on the Rust
+# side (see AGENTS.md's testing section), excluded whole-file rather than
+# function-by-function since there's nothing else in it to test in
+# isolation.
+omit = ["src/vigil_agent/cli.py"]
+
+[tool.coverage.report]
+exclude_also = [
+    # `ask()`'s body is the actual `query()` call into the Claude Agent
+    # SDK -- a real, costly (tokens, a live Claude Code session) network
+    # call. Its only non-trivial logic (`build_prompt`, `format_usage_footer`)
+    # is already extracted into separately-tested functions above it.
+    "async def ask\\(",
+]

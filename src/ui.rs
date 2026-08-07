@@ -1,20 +1,14 @@
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Sparkline, Table, Wrap};
-use ratatui::{Frame, Terminal};
+use ratatui::Frame;
 use std::collections::VecDeque;
-use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use sysinfo::System;
 
-use crate::alerts::AlertState;
-
 const HISTORY_LEN: usize = 120;
-const ALERT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const ALERT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const ALERT_LOG_LEN: usize = 5;
 
 pub struct UiOptions {
@@ -26,20 +20,20 @@ pub struct UiOptions {
     pub incidents_dir: String,
 }
 
-struct History {
+pub(crate) struct History {
     cpu: VecDeque<u64>,
     mem: VecDeque<u64>,
 }
 
 impl History {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             cpu: VecDeque::with_capacity(HISTORY_LEN),
             mem: VecDeque::with_capacity(HISTORY_LEN),
         }
     }
 
-    fn push(&mut self, cpu_pct: f32, mem_pct: f32) {
+    pub(crate) fn push(&mut self, cpu_pct: f32, mem_pct: f32) {
         push_capped(&mut self.cpu, cpu_pct.round() as u64, HISTORY_LEN);
         push_capped(&mut self.mem, mem_pct.round() as u64, HISTORY_LEN);
     }
@@ -81,16 +75,16 @@ impl Trend {
 /// that telling you whether it just spiked or has been climbing for an
 /// hour; this is the same distinction `agent::build_diagnosis_question`'s
 /// watch-log pointer exists to make for the agent's own answers.
-struct ProcTrends {
+pub(crate) struct ProcTrends {
     history: std::collections::HashMap<u32, VecDeque<u64>>,
 }
 
 impl ProcTrends {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { history: std::collections::HashMap::new() }
     }
 
-    fn record(&mut self, sys: &System) {
+    pub(crate) fn record(&mut self, sys: &System) {
         let seen: std::collections::HashSet<u32> = sys.processes().keys().map(|p| p.as_u32()).collect();
         self.history.retain(|pid, _| seen.contains(pid));
         for (pid, p) in sys.processes() {
@@ -131,22 +125,22 @@ fn classify_trend(oldest: u64, newest: u64) -> Trend {
 /// Snapshot of interactive state needed to render a frame. Kept separate
 /// from the event loop so `draw` stays a pure function of (system, history,
 /// app) — that's what makes it testable with `TestBackend`.
-struct AppState {
+pub(crate) struct AppState {
     top_n: usize,
-    input_mode: bool,
-    input_buffer: String,
-    thinking: bool,
-    answer: Option<Result<String, String>>,
+    pub(crate) input_mode: bool,
+    pub(crate) input_buffer: String,
+    pub(crate) thinking: bool,
+    pub(crate) answer: Option<Result<String, String>>,
     alert_log: VecDeque<String>,
     /// Only refreshed on the slower alert-check cadence (battery info needs
     /// a `pmset` shell-out) — `None` until the first such refresh happens.
-    battery_pct: Option<u8>,
-    battery_charging: Option<bool>,
-    battery_eta_secs: Option<u64>,
+    pub(crate) battery_pct: Option<u8>,
+    pub(crate) battery_charging: Option<bool>,
+    pub(crate) battery_eta_secs: Option<u64>,
 }
 
 impl AppState {
-    fn new(top_n: usize) -> Self {
+    pub(crate) fn new(top_n: usize) -> Self {
         Self {
             top_n,
             input_mode: false,
@@ -160,7 +154,7 @@ impl AppState {
         }
     }
 
-    fn push_alert(&mut self, line: String) {
+    pub(crate) fn push_alert(&mut self, line: String) {
         if self.alert_log.len() == ALERT_LOG_LEN {
             self.alert_log.pop_back();
         }
@@ -168,181 +162,23 @@ impl AppState {
     }
 }
 
-pub fn run(opts: UiOptions) -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.hide_cursor()?;
-
-    let mut sys = System::new_all();
-    let cpu_count = sys.cpus().len().max(1);
-    let mut history = History::new();
-    let mut trends = ProcTrends::new();
-    let mut app = AppState::new(opts.top_n);
-    let mut alert_state = AlertState::new();
-    let mut recent_alerts = crate::alerts::RecentAlerts::new();
-    let mut battery_trend = crate::battery::BatteryTrend::new();
-    let mut incident_tracker = crate::alerts::IncidentTracker::new();
-    // See main.rs's Watch loop for the rationale (2x cooldown).
-    let incident_timeout = opts.cooldown * 2;
-
-    let mut last_tick = Instant::now() - opts.interval; // force immediate first sample
-    let mut last_alert_check = Instant::now() - ALERT_CHECK_INTERVAL;
-
-    let result = loop {
-        if last_tick.elapsed() >= opts.interval {
-            last_tick = Instant::now();
-
-            let due_for_alerts = opts.notify && last_alert_check.elapsed() >= ALERT_CHECK_INTERVAL;
-            let (cpu_pct, mem_pct) = if due_for_alerts {
-                let now = Instant::now();
-                last_alert_check = now;
-                let snap = crate::take_snapshot(&mut sys, opts.top_n);
-                let snapshot_json = serde_json::to_string(&snap).unwrap_or_default();
-
-                battery_trend.record(
-                    snap.battery.as_ref().and_then(|b| b.charging),
-                    snap.battery.as_ref().and_then(|b| b.percentage),
-                    now,
-                );
-                let battery_eta = battery_trend.eta();
-                app.battery_pct = snap.battery.as_ref().and_then(|b| b.percentage);
-                app.battery_charging = snap.battery.as_ref().and_then(|b| b.charging);
-                app.battery_eta_secs = battery_eta.map(|d| d.as_secs());
-
-                let mut fired = crate::alerts::evaluate(&snap, cpu_count, &mut alert_state, opts.cooldown, now);
-                fired.extend(crate::alerts::evaluate_battery(&snap, battery_eta, &mut alert_state, opts.cooldown, now));
-                for alert in &fired {
-                    recent_alerts.record(&alert.key, &alert.message, now);
-                }
-                for alert in fired {
-                    app.push_alert(format!("[{}] {}", alert.key, alert.message));
-                    if incident_tracker.is_new_incident(alert.target.as_deref(), incident_timeout, now) {
-                        crate::alerts::notify(&alert);
-                        let context = recent_alerts.context_excluding(&alert.key, now);
-                        crate::agent::maybe_diagnose_alert_async(
-                            &alert,
-                            &snapshot_json,
-                            &opts.agent_dir,
-                            &opts.incidents_dir,
-                            context.as_deref(),
-                            None, // vigil ui's own snapshot loop doesn't write a persistent JSONL log
-                        );
-                    }
-                }
-                (sys.global_cpu_usage(), mem_percent(&sys))
-            } else {
-                sys.refresh_cpu_usage();
-                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-                sys.refresh_memory();
-                (sys.global_cpu_usage(), mem_percent(&sys))
-            };
-            history.push(cpu_pct, mem_pct);
-            trends.record(&sys);
-        }
-
-        terminal.draw(|f| draw(f, &sys, &history, &trends, &app))?;
-
-        let timeout = opts
-            .interval
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or(Duration::from_millis(50))
-            .min(Duration::from_millis(250));
-
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                if app.input_mode {
-                    match key.code {
-                        KeyCode::Enter => {
-                            let question = app.input_buffer.trim().to_string();
-                            app.input_mode = false;
-                            app.input_buffer.clear();
-                            if !question.is_empty() {
-                                app.thinking = true;
-                                app.answer = None;
-                                terminal.draw(|f| draw(f, &sys, &history, &trends, &app))?;
-
-                                let snap = crate::take_snapshot(&mut sys, opts.top_n);
-                                let snapshot_json = serde_json::to_string(&snap).unwrap_or_default();
-                                let result = crate::agent::ask(&question, &snapshot_json, &opts.agent_dir);
-                                app.answer = Some(result);
-                                app.thinking = false;
-                            }
-                        }
-                        KeyCode::Esc => {
-                            app.input_mode = false;
-                            app.input_buffer.clear();
-                        }
-                        KeyCode::Backspace => {
-                            app.input_buffer.pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.input_buffer.push(c);
-                        }
-                        _ => {}
-                    }
-                } else if app.answer.is_some() {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('a') => app.answer = None,
-                        KeyCode::Char('q') => break Ok(()),
-                        _ => {}
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                        KeyCode::Char('a') => {
-                            app.input_mode = true;
-                            app.input_buffer.clear();
-                        }
-                        KeyCode::Char('w') => {
-                            let top = sys
-                                .processes()
-                                .values()
-                                .max_by(|a, b| a.cpu_usage().partial_cmp(&b.cpu_usage()).unwrap());
-                            if let Some(p) = top {
-                                let question =
-                                    why_question(&p.name().to_string_lossy(), p.pid().as_u32(), p.cpu_usage(), p.memory());
-                                app.thinking = true;
-                                app.answer = None;
-                                terminal.draw(|f| draw(f, &sys, &history, &trends, &app))?;
-
-                                let snap = crate::take_snapshot(&mut sys, opts.top_n);
-                                let snapshot_json = serde_json::to_string(&snap).unwrap_or_default();
-                                let result = crate::agent::ask(&question, &snapshot_json, &opts.agent_dir);
-                                app.answer = Some(result);
-                                app.thinking = false;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    };
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
-}
-
 /// The pre-filled question the `w` key sends about whichever process
 /// currently ranks #1 by CPU — pure so the exact wording is unit-tested
 /// without going through a real key event / System.
-fn why_question(name: &str, pid: u32, cpu_pct: f32, mem_bytes: u64) -> String {
+pub(crate) fn why_question(name: &str, pid: u32, cpu_pct: f32, mem_bytes: u64) -> String {
     format!(
         "Why is {name} (pid {pid}) using {cpu_pct:.0}% CPU and {:.0} MB memory right now?",
         mem_bytes as f64 / 1e6
     )
 }
 
-fn mem_percent(sys: &System) -> f32 {
+/// Coverage exemption (see AGENTS.md's testing section): unlike
+/// `collect_disks`'s equivalent guard, `total_memory() == 0` isn't
+/// structurally ruled out by anything upstream (no filter guarantees it) --
+/// it's a real defensive check against a division by zero, just one that
+/// never actually happens on real Mac hardware, so a unit test can't reach
+/// the `else` branch without a fake `System` sysinfo doesn't offer.
+pub(crate) fn mem_percent(sys: &System) -> f32 {
     if sys.total_memory() > 0 {
         sys.used_memory() as f32 / sys.total_memory() as f32 * 100.0
     } else {
@@ -350,7 +186,7 @@ fn mem_percent(sys: &System) -> f32 {
     }
 }
 
-fn draw(f: &mut Frame, sys: &System, history: &History, trends: &ProcTrends, app: &AppState) {
+pub(crate) fn draw(f: &mut Frame, sys: &System, history: &History, trends: &ProcTrends, app: &AppState) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -605,6 +441,13 @@ mod tests {
     }
 
     #[test]
+    fn mem_percent_reports_a_plausible_percentage_on_this_machine() {
+        let sys = System::new_all();
+        let pct = mem_percent(&sys);
+        assert!((0.0..=100.0).contains(&pct));
+    }
+
+    #[test]
     fn why_question_names_the_process_and_its_current_usage() {
         let q = why_question("pycharm", 37489, 176.3, 17_671_000_000);
         assert!(q.contains("pycharm"));
@@ -781,5 +624,64 @@ mod tests {
         }
         assert_eq!(app.alert_log.len(), ALERT_LOG_LEN);
         assert_eq!(app.alert_log.front().unwrap(), &format!("alert {}", ALERT_LOG_LEN + 2));
+    }
+
+    #[test]
+    fn trend_arrow_renders_each_direction_distinctly() {
+        assert_eq!(Trend::Up.arrow(), "↑");
+        assert_eq!(Trend::Down.arrow(), "↓");
+        assert_eq!(Trend::Stable.arrow(), "→");
+    }
+
+    #[test]
+    fn proc_trends_record_tracks_real_processes_and_forgets_dead_ones() {
+        let mut sys = System::new_all();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let mut trends = ProcTrends::new();
+        trends.record(&sys);
+        trends.record(&sys);
+
+        // Every currently-live pid should now have at least 2 samples tracked.
+        for pid in sys.processes().keys().take(5) {
+            assert!(trends.history.get(&pid.as_u32()).is_some_and(|h| h.len() >= 2));
+        }
+
+        // A pid that has since disappeared is pruned on the next record().
+        trends.history.insert(u32::MAX, VecDeque::from([1, 2]));
+        trends.record(&sys);
+        assert!(!trends.history.contains_key(&u32::MAX));
+    }
+
+    #[test]
+    fn draw_thinking_popup_shows_while_awaiting_the_agent() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let sys = System::new_all();
+        let trends = ProcTrends::new();
+        let history = History::new();
+        let mut app = AppState::new(5);
+        app.thinking = true;
+
+        terminal.draw(|f| draw(f, &sys, &history, &trends, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("Asking the agent"));
+        assert!(text.contains("vigil-agent"));
+    }
+
+    #[test]
+    fn battery_summary_shows_draining_without_an_eta_yet() {
+        let app = AppState { battery_pct: Some(55), battery_charging: Some(false), battery_eta_secs: None, ..AppState::new(5) };
+        let summary = battery_summary(&app);
+        assert!(summary.contains("55%"));
+        assert!(summary.contains("draining"));
+        assert!(!summary.contains("left"), "no ETA yet, so no '~N left' should appear");
+    }
+
+    #[test]
+    fn battery_summary_shows_percentage_with_unknown_charging_state() {
+        let app = AppState { battery_pct: Some(64), battery_charging: None, ..AppState::new(5) };
+        let summary = battery_summary(&app);
+        assert_eq!(summary, "battery 64%");
     }
 }
