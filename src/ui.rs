@@ -61,6 +61,11 @@ struct AppState {
     thinking: bool,
     answer: Option<Result<String, String>>,
     alert_log: VecDeque<String>,
+    /// Only refreshed on the slower alert-check cadence (battery info needs
+    /// a `pmset` shell-out) — `None` until the first such refresh happens.
+    battery_pct: Option<u8>,
+    battery_charging: Option<bool>,
+    battery_eta_secs: Option<u64>,
 }
 
 impl AppState {
@@ -72,6 +77,9 @@ impl AppState {
             thinking: false,
             answer: None,
             alert_log: VecDeque::with_capacity(ALERT_LOG_LEN),
+            battery_pct: None,
+            battery_charging: None,
+            battery_eta_secs: None,
         }
     }
 
@@ -96,6 +104,7 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
     let mut history = History::new();
     let mut app = AppState::new(opts.top_n);
     let mut alert_state = AlertState::new();
+    let mut battery_trend = crate::battery::BatteryTrend::new();
 
     let mut last_tick = Instant::now() - opts.interval; // force immediate first sample
     let mut last_alert_check = Instant::now() - ALERT_CHECK_INTERVAL;
@@ -106,10 +115,24 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
 
             let due_for_alerts = opts.notify && last_alert_check.elapsed() >= ALERT_CHECK_INTERVAL;
             let (cpu_pct, mem_pct) = if due_for_alerts {
-                last_alert_check = Instant::now();
+                let now = Instant::now();
+                last_alert_check = now;
                 let snap = crate::take_snapshot(&mut sys, opts.top_n);
                 let snapshot_json = serde_json::to_string(&snap).unwrap_or_default();
-                for alert in crate::alerts::evaluate(&snap, cpu_count, &mut alert_state, opts.cooldown, Instant::now()) {
+
+                battery_trend.record(
+                    snap.battery.as_ref().and_then(|b| b.charging),
+                    snap.battery.as_ref().and_then(|b| b.percentage),
+                    now,
+                );
+                let battery_eta = battery_trend.eta();
+                app.battery_pct = snap.battery.as_ref().and_then(|b| b.percentage);
+                app.battery_charging = snap.battery.as_ref().and_then(|b| b.charging);
+                app.battery_eta_secs = battery_eta.map(|d| d.as_secs());
+
+                let mut fired = crate::alerts::evaluate(&snap, cpu_count, &mut alert_state, opts.cooldown, now);
+                fired.extend(crate::alerts::evaluate_battery(&snap, battery_eta, &mut alert_state, opts.cooldown, now));
+                for alert in fired {
                     app.push_alert(format!("[{}] {}", alert.key, alert.message));
                     crate::alerts::notify(&alert);
                     crate::agent::maybe_diagnose_alert_async(&alert, &snapshot_json, &opts.agent_dir);
@@ -206,14 +229,14 @@ fn draw(f: &mut Frame, sys: &System, history: &History, app: &AppState) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Length(7),
             Constraint::Min(6),
             Constraint::Length(1),
         ])
         .split(f.area());
 
-    draw_header(f, root[0], sys);
+    draw_header(f, root[0], sys, app);
     draw_sparklines(f, root[1], history);
     draw_process_table(f, root[2], sys, app.top_n);
     draw_footer(f, root[3], app);
@@ -227,7 +250,7 @@ fn draw(f: &mut Frame, sys: &System, history: &History, app: &AppState) {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, sys: &System) {
+fn draw_header(f: &mut Frame, area: Rect, sys: &System, app: &AppState) {
     let load = System::load_average();
     let mem_used_gb = sys.used_memory() as f64 / 1e9;
     let mem_total_gb = sys.total_memory() as f64 / 1e9;
@@ -236,14 +259,32 @@ fn draw_header(f: &mut Frame, area: Rect, sys: &System) {
     let text = Line::from(vec![
         Span::styled(" vigil ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw(format!(
-            "  load {:.1} {:.1} {:.1}   mem {:.1}/{:.1} GB   swap {:.1} GB   cpu {:.0}%",
+            "  load {:.1} {:.1} {:.1}   mem {:.1}/{:.1} GB   swap {:.1} GB   cpu {:.0}%   {}",
             load.one, load.five, load.fifteen, mem_used_gb, mem_total_gb, swap_used_gb,
-            sys.global_cpu_usage()
+            sys.global_cpu_usage(),
+            battery_summary(app)
         )),
     ]);
 
     let block = Block::default().borders(Borders::ALL).title(" system ");
-    f.render_widget(Paragraph::new(text).block(block), area);
+    // Wrap instead of the default clip: on a narrow terminal this line can
+    // exceed the width, and silently truncating (losing e.g. the battery
+    // ETA at the tail) is worse than spilling onto a second line.
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }).block(block), area);
+}
+
+fn battery_summary(app: &AppState) -> String {
+    let Some(pct) = app.battery_pct else {
+        return "battery n/a".to_string();
+    };
+    match app.battery_charging {
+        Some(true) => format!("battery {pct}% (charging)"),
+        Some(false) => match app.battery_eta_secs {
+            Some(secs) => format!("battery {pct}% (draining, ~{} left)", crate::battery::format_eta(Duration::from_secs(secs))),
+            None => format!("battery {pct}% (draining)"),
+        },
+        None => format!("battery {pct}%"),
+    }
 }
 
 fn draw_sparklines(f: &mut Frame, area: Rect, history: &History) {
@@ -419,6 +460,43 @@ mod tests {
         assert!(text.contains("MEM"));
         assert!(text.contains("quit"));
         assert!(text.contains("ask agent"));
+        assert!(text.contains("battery n/a"), "no battery sample fetched yet");
+    }
+
+    #[test]
+    fn header_shows_draining_battery_with_eta() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let sys = System::new_all();
+        let history = History::new();
+        let mut app = AppState::new(5);
+        app.battery_pct = Some(37);
+        app.battery_charging = Some(false);
+        app.battery_eta_secs = Some(42 * 60);
+
+        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("37%"));
+        assert!(text.contains("draining"));
+        assert!(text.contains("42m"));
+    }
+
+    #[test]
+    fn header_shows_charging_battery() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let sys = System::new_all();
+        let history = History::new();
+        let mut app = AppState::new(5);
+        app.battery_pct = Some(80);
+        app.battery_charging = Some(true);
+
+        terminal.draw(|f| draw(f, &sys, &history, &app)).unwrap();
+
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("80%"));
+        assert!(text.contains("charging"));
     }
 
     #[test]

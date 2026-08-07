@@ -32,28 +32,31 @@ pub fn ask(question: &str, snapshot_json: &str, agent_dir: &str) -> Result<Strin
     }
 }
 
-/// CPU-related alert keys that are worth an automatic agent diagnosis.
-/// Disk/memory alerts already tell the user to press 'a' themselves —
-/// CPU spikes are the case where a background explanation is most useful
-/// (by the time you'd type a question, the spike may already be gone).
+/// Alert keys worth an automatic agent diagnosis: CPU spikes (by the time
+/// you'd type a question, the spike may already be gone) and low battery
+/// (root-causing a drain benefits from the agent actually checking thermal
+/// state / recent high-CPU history rather than a static rule). Disk and
+/// plain memory-pressure alerts are left to the interactive 'a' flow.
 fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
-    alert_key == "high_load" || alert_key.starts_with("cpu_hog:")
+    alert_key == "high_load" || alert_key.starts_with("cpu_hog:") || alert_key == "battery_low"
 }
 
-/// If `alert` is CPU-related, ask the agent to explain it in a background
+/// If `alert` is worth it, ask the agent to investigate in a background
 /// thread and fire a follow-up notification with the answer once ready.
-/// Never blocks the caller. Purely informational: the agent only produces
-/// text here, it never executes anything — same read-only contract as the
-/// interactive 'a' flow. A failed diagnosis is logged, not surfaced as a
-/// notification, since the plain rule-based alert already fired.
+/// Never blocks the caller. The agent has real (read-only) investigation
+/// tools here — same contract as the interactive 'a' flow: it can look
+/// around (logs, `sample`, `vm_stat`, ...) but never modify anything. A
+/// failed diagnosis is logged, not surfaced as a notification, since the
+/// plain rule-based alert already fired.
 pub fn maybe_diagnose_alert_async(alert: &crate::alerts::Alert, snapshot_json: &str, agent_dir: &str) {
     if !is_auto_diagnose_worthy(&alert.key) {
         return;
     }
 
     let question = format!(
-        "A monitoring rule just fired: \"{}\". Using only the snapshot data, explain the likely \
-         cause and suggest what to check or do next.",
+        "A monitoring rule just fired: \"{}\". Investigate the likely cause — check beyond the \
+         snapshot if useful (e.g. logs, `sample` a hot pid, thermal state) — and suggest what to \
+         check or do next.",
         alert.message
     );
     let title = format!("{} — agent diagnosis", alert.title);
@@ -130,9 +133,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_diagnose_worthy_for_high_load_and_cpu_hog() {
+    fn auto_diagnose_worthy_for_cpu_and_battery_alerts() {
         assert!(is_auto_diagnose_worthy("high_load"));
         assert!(is_auto_diagnose_worthy("cpu_hog:1234"));
+        assert!(is_auto_diagnose_worthy("battery_low"));
     }
 
     #[test]

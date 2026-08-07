@@ -1,5 +1,6 @@
 mod agent;
 mod alerts;
+mod battery;
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -117,6 +118,10 @@ struct MemoryInfo {
 struct BatteryInfo {
     percentage: Option<u8>,
     charging: Option<bool>,
+    /// macOS's own "H:MM remaining" estimate, in seconds. `None` when
+    /// pmset shows "0:00"/"(no estimate)" (i.e. not discharging, or still
+    /// calibrating right after a state change).
+    remaining_secs: Option<u64>,
     raw: String,
 }
 
@@ -238,8 +243,24 @@ fn parse_battery_line(line: &str) -> Option<BatteryInfo> {
     Some(BatteryInfo {
         percentage,
         charging,
+        remaining_secs: parse_remaining_secs(line),
         raw: line.trim().to_string(),
     })
+}
+
+/// Parses the "H:MM remaining" segment pmset prints when actively
+/// discharging. Returns `None` for "0:00" (pmset's way of saying N/A when
+/// not discharging) and for "(no estimate)" right after a state change.
+fn parse_remaining_secs(line: &str) -> Option<u64> {
+    let before_remaining = line.split("remaining").next()?;
+    let token = before_remaining.split_whitespace().last()?;
+    let (h, m) = token.split_once(':')?;
+    let h: u64 = h.parse().ok()?;
+    let m: u64 = m.parse().ok()?;
+    if h == 0 && m == 0 {
+        return None;
+    }
+    Some(h * 3600 + m * 60)
 }
 
 fn main() {
@@ -268,6 +289,7 @@ fn main() {
 
             let cpu_count = sys.cpus().len();
             let mut alert_state = alerts::AlertState::new();
+            let mut battery_trend = battery::BatteryTrend::new();
             let cooldown = Duration::from_secs(cooldown_secs);
 
             let mut n: u64 = 0;
@@ -276,16 +298,28 @@ fn main() {
                 let line = serde_json::to_string(&snap).unwrap();
                 writeln!(file, "{line}").expect("failed to write snapshot");
                 file.flush().ok();
+
+                let now = Instant::now();
+                battery_trend.record(
+                    snap.battery.as_ref().and_then(|b| b.charging),
+                    snap.battery.as_ref().and_then(|b| b.percentage),
+                    now,
+                );
+                let battery_eta = battery_trend.eta();
+
                 eprintln!(
-                    "[vigil] sample {} @ {} — load1={:.2} mem_used={:.1}GB",
+                    "[vigil] sample {} @ {} — load1={:.2} mem_used={:.1}GB{}",
                     n + 1,
                     snap.ts_unix,
                     snap.load_avg.one,
-                    snap.memory.used_bytes as f64 / 1e9
+                    snap.memory.used_bytes as f64 / 1e9,
+                    battery_eta.map(|e| format!(" battery_eta={}", battery::format_eta(e))).unwrap_or_default()
                 );
 
                 if !no_notify {
-                    for alert in alerts::evaluate(&snap, cpu_count, &mut alert_state, cooldown, Instant::now()) {
+                    let mut fired = alerts::evaluate(&snap, cpu_count, &mut alert_state, cooldown, now);
+                    fired.extend(alerts::evaluate_battery(&snap, battery_eta, &mut alert_state, cooldown, now));
+                    for alert in fired {
                         eprintln!("[vigil] ALERT [{}] {}", alert.key, alert.message);
                         alerts::notify(&alert);
                         agent::maybe_diagnose_alert_async(&alert, &line, &agent_dir);
@@ -315,5 +349,43 @@ fn main() {
             };
             ui::run(opts).expect("ui failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_discharging_battery_line() {
+        let line = "-InternalBattery-0 (id=36044899)\t92%; discharging; 2:26 remaining present: true";
+        let b = parse_battery_line(line).unwrap();
+        assert_eq!(b.percentage, Some(92));
+        assert_eq!(b.charging, Some(false));
+        assert_eq!(b.remaining_secs, Some(2 * 3600 + 26 * 60));
+    }
+
+    #[test]
+    fn parses_charging_battery_line() {
+        let line = "-InternalBattery-0 (id=36044899)\t13%; charging; 2:21 remaining present: true";
+        let b = parse_battery_line(line).unwrap();
+        assert_eq!(b.percentage, Some(13));
+        assert_eq!(b.charging, Some(true));
+    }
+
+    #[test]
+    fn charged_and_plugged_in_has_no_remaining_estimate() {
+        let line = "-InternalBattery-0 (id=36044899)\t100%; charged; 0:00 remaining present: true";
+        let b = parse_battery_line(line).unwrap();
+        assert_eq!(b.percentage, Some(100));
+        assert_eq!(b.remaining_secs, None);
+    }
+
+    #[test]
+    fn no_estimate_right_after_unplugging_is_handled() {
+        let line = "-InternalBattery-0 (id=36044899)\t87%; discharging; (no estimate) present: true";
+        let b = parse_battery_line(line).unwrap();
+        assert_eq!(b.percentage, Some(87));
+        assert_eq!(b.remaining_secs, None);
     }
 }

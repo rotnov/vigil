@@ -34,3 +34,10 @@ def test_system_prompt_forbids_fabricating_files():
 
 def test_system_prompt_requires_confirmation_before_risky_actions():
     assert "confirmation" in SYSTEM_PROMPT.lower()
+
+
+def test_system_prompt_forbids_modifying_the_system_despite_shell_access():
+    lowered = SYSTEM_PROMPT.lower()
+    assert "inspect the system, never change it" in lowered
+    assert "kill" in lowered
+    assert "sudo" in lowered

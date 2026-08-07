@@ -14,18 +14,65 @@ from claude_agent_sdk import (
 
 from .prompts import SYSTEM_PROMPT, build_prompt
 
+# Investigation tools: Bash/Read/Grep/Glob so the agent can actually dig
+# (log show, sample <pid>, du -sh, docker system df, tmutil listlocalsnapshots,
+# vm_stat, ps, cat a log file, ...) instead of only reasoning over the
+# snapshot JSON. Deliberately excludes Write/Edit — the agent can inspect
+# the system but never modify it.
+ALLOWED_TOOLS = ["Bash", "Read", "Grep", "Glob"]
+
+# Command-pattern denylist on top of the allowlist above. This runs for
+# BOTH the interactive ('a' key) and the automatic background CPU-alert
+# diagnosis (see agent.rs::maybe_diagnose_alert_async) — the background
+# path has no one watching, so these rails apply unconditionally, not just
+# when unattended. Investigation must stay read-only: no killing processes,
+# no deleting/moving files, no privilege escalation, no power state changes.
+DISALLOWED_TOOLS = [
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Bash(sudo *)",
+    "Bash(su *)",
+    "Bash(rm *)",
+    "Bash(rmdir *)",
+    "Bash(mv *)",
+    "Bash(dd *)",
+    "Bash(kill *)",
+    "Bash(killall *)",
+    "Bash(pkill *)",
+    "Bash(diskutil erase*)",
+    "Bash(diskutil partition*)",
+    "Bash(diskutil eraseVolume*)",
+    "Bash(launchctl unload*)",
+    "Bash(launchctl bootout*)",
+    "Bash(launchctl remove*)",
+    "Bash(chmod *)",
+    "Bash(chown *)",
+    "Bash(shutdown *)",
+    "Bash(reboot *)",
+    "Bash(halt *)",
+    "Bash(defaults write*)",
+    "Bash(defaults delete*)",
+]
+
+MAX_INVESTIGATION_TURNS = 15
+
 
 async def ask(snapshot: dict[str, Any], question: str | None) -> str:
-    """Reason over a snapshot and answer a question about it.
+    """Investigate a snapshot (and, if needed, the live system) and answer a question.
 
-    Read-only by design: allowed_tools=[] means the agent has no filesystem
-    or bash access in v1, it can only reason over the snapshot it was given.
+    The agent can read files and run informational shell commands to dig
+    past the snapshot's numbers (e.g. `log show`, `sample <pid>`, `du -sh`),
+    but Write/Edit are excluded and a denylist blocks destructive or
+    privilege-escalating Bash patterns — see DISALLOWED_TOOLS. It can only
+    ever produce text: it never kills a process or deletes anything itself.
     """
     prompt = build_prompt(snapshot, question)
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
-        allowed_tools=[],
-        max_turns=1,
+        allowed_tools=ALLOWED_TOOLS,
+        disallowed_tools=DISALLOWED_TOOLS,
+        max_turns=MAX_INVESTIGATION_TURNS,
     )
 
     chunks: list[str] = []

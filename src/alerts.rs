@@ -14,6 +14,7 @@ const LOW_FREE_MEM_RATIO: f64 = 0.05;
 const CPU_HOG_THRESHOLD_PCT: f32 = 90.0;
 const CPU_HOG_STREAK_REQUIRED: u32 = 3;
 const LOW_DISK_AVAILABLE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
+const LOW_BATTERY_PCT: u8 = 20;
 
 pub struct Alert {
     pub key: String,
@@ -160,6 +161,50 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
     }
 
     alerts
+}
+
+/// Separate from `evaluate` because it needs a drain-rate ETA computed
+/// from history across multiple snapshots (`battery::BatteryTrend`), which
+/// `evaluate` — a pure function of a single `Snapshot` — has no access to.
+pub fn evaluate_battery(
+    snap: &Snapshot,
+    eta: Option<Duration>,
+    state: &mut AlertState,
+    cooldown: Duration,
+    now: Instant,
+) -> Option<Alert> {
+    let battery = snap.battery.as_ref()?;
+    if battery.charging != Some(false) {
+        return None;
+    }
+    let pct = battery.percentage?;
+    if pct > LOW_BATTERY_PCT {
+        return None;
+    }
+
+    let eta_str = eta
+        .map(crate::battery::format_eta)
+        .or(battery.remaining_secs.map(|s| crate::battery::format_eta(Duration::from_secs(s))))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let top_hint = snap.top_cpu.first().map_or_else(String::new, |p| {
+        format!(
+            " Heaviest CPU consumer right now: {} ({:.0}%) — closing CPU-heavy apps is the \
+             biggest lever without per-process power data.",
+            p.name, p.cpu_pct
+        )
+    });
+
+    let mut alerts = Vec::new();
+    state.try_fire(
+        now,
+        cooldown,
+        "battery_low",
+        "vigil: low battery",
+        format!("Battery at {pct}%, discharging, ~{eta_str} remaining.{top_hint}"),
+        &mut alerts,
+    );
+    alerts.into_iter().next()
 }
 
 /// Fire a native macOS notification. Purely informational — never runs any
@@ -320,5 +365,69 @@ mod tests {
         snap.top_cpu = vec![proc(99, "spiky", 10.0, 200)];
         evaluate(&snap, 8, &mut state, cooldown, now);
         assert_eq!(state.cpu_hog_streak.get(&99), None, "streak must reset once CPU usage drops");
+    }
+
+    fn battery(percentage: u8, charging: Option<bool>, remaining_secs: Option<u64>) -> crate::BatteryInfo {
+        crate::BatteryInfo {
+            percentage: Some(percentage),
+            charging,
+            remaining_secs,
+            raw: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn no_battery_alert_when_charging_or_full() {
+        let mut snap = healthy_snapshot();
+        snap.battery = Some(battery(10, Some(true), None));
+        let mut state = AlertState::new();
+        assert!(evaluate_battery(&snap, None, &mut state, Duration::from_secs(300), Instant::now()).is_none());
+
+        snap.battery = Some(battery(80, Some(false), None));
+        assert!(evaluate_battery(&snap, None, &mut state, Duration::from_secs(300), Instant::now()).is_none());
+    }
+
+    #[test]
+    fn low_battery_fires_with_top_cpu_hint() {
+        let mut snap = healthy_snapshot();
+        snap.battery = Some(battery(15, Some(false), Some(3600)));
+        snap.top_cpu = vec![proc(7, "hungry", 88.0, 900)];
+
+        let mut state = AlertState::new();
+        let alert = evaluate_battery(&snap, None, &mut state, Duration::from_secs(300), Instant::now())
+            .expect("should fire at 15% discharging");
+        assert_eq!(alert.key, "battery_low");
+        assert!(alert.message.contains("15%"));
+        assert!(alert.message.contains("hungry"));
+        assert!(alert.message.contains("1h00m"), "falls back to pmset's own remaining_secs when no trend ETA: {}", alert.message);
+    }
+
+    #[test]
+    fn low_battery_prefers_trend_eta_over_pmset_estimate() {
+        let mut snap = healthy_snapshot();
+        snap.battery = Some(battery(15, Some(false), Some(3600)));
+
+        let mut state = AlertState::new();
+        let alert = evaluate_battery(
+            &snap,
+            Some(Duration::from_secs(42 * 60)),
+            &mut state,
+            Duration::from_secs(300),
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(alert.message.contains("42m"));
+    }
+
+    #[test]
+    fn low_battery_respects_cooldown() {
+        let mut snap = healthy_snapshot();
+        snap.battery = Some(battery(10, Some(false), Some(600)));
+        let mut state = AlertState::new();
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(300);
+
+        assert!(evaluate_battery(&snap, None, &mut state, cooldown, now).is_some());
+        assert!(evaluate_battery(&snap, None, &mut state, cooldown, now).is_none());
     }
 }
