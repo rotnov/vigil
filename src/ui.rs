@@ -300,6 +300,25 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                             app.input_mode = true;
                             app.input_buffer.clear();
                         }
+                        KeyCode::Char('w') => {
+                            let top = sys
+                                .processes()
+                                .values()
+                                .max_by(|a, b| a.cpu_usage().partial_cmp(&b.cpu_usage()).unwrap());
+                            if let Some(p) = top {
+                                let question =
+                                    why_question(&p.name().to_string_lossy(), p.pid().as_u32(), p.cpu_usage(), p.memory());
+                                app.thinking = true;
+                                app.answer = None;
+                                terminal.draw(|f| draw(f, &sys, &history, &trends, &app))?;
+
+                                let snap = crate::take_snapshot(&mut sys, opts.top_n);
+                                let snapshot_json = serde_json::to_string(&snap).unwrap_or_default();
+                                let result = crate::agent::ask(&question, &snapshot_json, &opts.agent_dir);
+                                app.answer = Some(result);
+                                app.thinking = false;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -311,6 +330,16 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
+}
+
+/// The pre-filled question the `w` key sends about whichever process
+/// currently ranks #1 by CPU — pure so the exact wording is unit-tested
+/// without going through a real key event / System.
+fn why_question(name: &str, pid: u32, cpu_pct: f32, mem_bytes: u64) -> String {
+    format!(
+        "Why is {name} (pid {pid}) using {cpu_pct:.0}% CPU and {:.0} MB memory right now?",
+        mem_bytes as f64 / 1e6
+    )
 }
 
 fn mem_percent(sys: &System) -> f32 {
@@ -448,7 +477,7 @@ fn draw_process_table(f: &mut Frame, area: Rect, sys: &System, trends: &ProcTren
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
-    let hint = " q/esc: quit   a: ask agent ";
+    let hint = " q/esc: quit   a: ask agent   w: why is the top process using so much ";
     let text = if let Some(recent) = app.alert_log.front() {
         Line::from(vec![
             Span::styled(hint, Style::default().fg(Color::DarkGray)),
@@ -573,6 +602,15 @@ mod tests {
         // Dips in the middle don't matter -- only the window's endpoints.
         trends.history.insert(7, VecDeque::from([1000, 200, 1300]));
         assert_eq!(trends.mem_trend(7), Some(Trend::Up));
+    }
+
+    #[test]
+    fn why_question_names_the_process_and_its_current_usage() {
+        let q = why_question("pycharm", 37489, 176.3, 17_671_000_000);
+        assert!(q.contains("pycharm"));
+        assert!(q.contains("37489"));
+        assert!(q.contains("176%"));
+        assert!(q.contains("17671 MB"));
     }
 
     #[test]
