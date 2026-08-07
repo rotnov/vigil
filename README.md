@@ -18,7 +18,8 @@ without you doing it yourself.
 - `vigil snapshot` — a single JSON snapshot to stdout (for scripts/the agent)
 - `vigil watch` — continuously appends snapshots to JSONL + fires native macOS
   notifications on detected anomalies (high load average, active swap, a process
-  holding CPU for several consecutive samples, low disk space, low battery)
+  holding CPU for several consecutive samples, low disk space, low battery, an
+  unusually high TCP connection count, or unusual incoming connections)
 - `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes,
   battery % with a drain-rate ETA when discharging), `a` key — ask the agent a
   question right from the interface
@@ -45,6 +46,13 @@ time — there's no per-process power attribution (that needs `powermetrics
 --show-process-energy`, which requires sudo; deliberately not added). The low-battery
 alert instead points at the heaviest CPU consumer in the snapshot as the best available
 proxy, and the agent can dig further (e.g. `pmset -g therm`) if asked.
+
+Connection counts come from `netstat -an` (both `inet`/`inet6`), classified by state.
+"Incoming" is a heuristic, not a kernel-verified fact — an `ESTABLISHED` connection
+counts as incoming when its local port matches one of this machine's own `LISTEN`
+ports and the remote peer isn't loopback; see
+[docs/decisions/0001-network-connection-monitoring.md](docs/decisions/0001-network-connection-monitoring.md)
+for why, and for how the (first-guess, expect-to-tune) thresholds were picked.
 
 Notifications and the agent **only suggest** — they never kill, delete, or modify
 anything on their own.
@@ -98,7 +106,15 @@ vigil (Rust)                          agent/ (Python, Claude Agent SDK)
 ├── incidents.rs — markdown journal
 │   for auto-diagnoses only
 │   (~/.vigil/incidents/)
+├── main.rs — snapshot collection,
+│   incl. connection counts via
+│   `netstat` (see docs/decisions/0001)
 └── agent.rs — shell wrapper around
     `uv run vigil-agent ask ...`,
     plus the auto-diagnose trigger
 ```
+
+Project-wide design decisions with a real alternative (a parsing strategy, an alert
+heuristic, a new subsystem) are recorded under
+[`docs/decisions/`](docs/decisions/) as short ADRs. See `AGENTS.md` for the full
+project rule set (language, testing conventions, the live incident-monitoring loop).

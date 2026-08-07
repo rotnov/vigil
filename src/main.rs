@@ -110,6 +110,7 @@ struct Snapshot {
     memory: MemoryInfo,
     disks: Vec<DiskInfo>,
     battery: Option<BatteryInfo>,
+    connections: Option<ConnectionCounts>,
     top_cpu: Vec<ProcInfo>,
     top_mem: Vec<ProcInfo>,
 }
@@ -147,6 +148,24 @@ struct BatteryInfo {
     /// calibrating right after a state change).
     remaining_secs: Option<u64>,
     raw: String,
+}
+
+#[derive(Serialize, Default, Debug, PartialEq)]
+struct ConnectionCounts {
+    established: u32,
+    listen: u32,
+    time_wait: u32,
+    close_wait: u32,
+    other: u32,
+    total: u32,
+    /// ESTABLISHED connections whose local port matches one of our own
+    /// LISTEN ports *and* whose remote peer isn't loopback — i.e. someone
+    /// out on the network actually connected in to a service this machine
+    /// is running, as opposed to two local processes talking over
+    /// 127.0.0.1 or this machine reaching out to something else. See
+    /// docs/decisions/0001-network-connection-monitoring.md for why this
+    /// heuristic (not a true kernel-level "who dialed whom") is what's used.
+    incoming: u32,
 }
 
 fn take_snapshot(sys: &mut System, top_n: usize) -> Snapshot {
@@ -195,6 +214,7 @@ fn take_snapshot(sys: &mut System, top_n: usize) -> Snapshot {
         },
         disks: collect_disks(),
         battery: read_battery(),
+        connections: collect_connections(),
         top_cpu,
         top_mem,
     }
@@ -285,6 +305,83 @@ fn parse_remaining_secs(line: &str) -> Option<u64> {
         return None;
     }
     Some(h * 3600 + m * 60)
+}
+
+/// Shells out to `netstat` (once for IPv4, once for IPv6 — `sysinfo` has no
+/// per-connection API) and classifies each TCP entry by state. See
+/// `docs/decisions/0001-network-connection-monitoring.md` for why `netstat`
+/// over `lsof`, and for the "incoming" heuristic.
+fn collect_connections() -> Option<ConnectionCounts> {
+    let inet = Command::new("netstat").args(["-an", "-f", "inet"]).output().ok()?;
+    let inet6 = Command::new("netstat").args(["-an", "-f", "inet6"]).output().ok()?;
+    let mut combined = String::from_utf8_lossy(&inet.stdout).into_owned();
+    combined.push('\n');
+    combined.push_str(&String::from_utf8_lossy(&inet6.stdout));
+    Some(parse_netstat_output(&combined))
+}
+
+/// Pure parser, kept separate from the `Command` calls above so it can be
+/// unit-tested against captured `netstat` output without shelling out.
+fn parse_netstat_output(output: &str) -> ConnectionCounts {
+    struct Row<'a> {
+        local: &'a str,
+        foreign: &'a str,
+        state: &'a str,
+    }
+
+    let rows: Vec<Row> = output
+        .lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 6 || !cols[0].starts_with("tcp") {
+                return None;
+            }
+            Some(Row {
+                local: cols[3],
+                foreign: cols[4],
+                state: cols[5],
+            })
+        })
+        .collect();
+
+    let listen_ports: std::collections::HashSet<&str> =
+        rows.iter().filter(|r| r.state == "LISTEN").filter_map(|r| netstat_port(r.local)).collect();
+
+    let mut counts = ConnectionCounts::default();
+    for row in &rows {
+        counts.total += 1;
+        match row.state {
+            "ESTABLISHED" => counts.established += 1,
+            "LISTEN" => counts.listen += 1,
+            "TIME_WAIT" => counts.time_wait += 1,
+            "CLOSE_WAIT" => counts.close_wait += 1,
+            _ => counts.other += 1,
+        }
+        if row.state == "ESTABLISHED" && !is_loopback(row.foreign) {
+            if let Some(port) = netstat_port(row.local) {
+                if listen_ports.contains(port) {
+                    counts.incoming += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// `netstat` prints addresses as `host.port` (e.g. `127.0.0.1.64342`,
+/// `*.61118`, or the IPv6 form `2001:8a0:616a:50.57419`) — the port is
+/// always the component after the last `.`.
+fn netstat_port(addr: &str) -> Option<&str> {
+    let port = addr.rsplit('.').next()?;
+    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(port)
+}
+
+fn is_loopback(addr: &str) -> bool {
+    let host = addr.rsplit_once('.').map(|(h, _)| h).unwrap_or(addr);
+    host == "127.0.0.1" || host == "::1" || host.starts_with("127.")
 }
 
 fn main() {
@@ -482,5 +579,84 @@ mod tests {
         let b = parse_battery_line(line).unwrap();
         assert_eq!(b.percentage, Some(87));
         assert_eq!(b.remaining_secs, None);
+    }
+
+    // Captured from a real `netstat -an -f inet` / `-f inet6` run on this
+    // machine (2026-08-07), trimmed to a representative sample of each
+    // state plus the header lines every real invocation includes.
+    const NETSTAT_SAMPLE: &str = "\
+Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address                                 Foreign Address                               (state)
+tcp4       0      0  127.0.0.1.64342        127.0.0.1.57332        ESTABLISHED
+tcp4       0      0  127.0.0.1.57332        127.0.0.1.64342        ESTABLISHED
+tcp46      0      0  *.61118                *.*                    LISTEN
+tcp4       0      0  127.0.0.1.27403        *.*                    LISTEN
+tcp4       0      0  93.184.216.34.443      10.0.0.5.54321         TIME_WAIT
+tcp4       0      0  10.0.0.5.54322         93.184.216.34.443      CLOSE_WAIT
+udp4       0      0  *.68                   *.*
+tcp6       0      0  2001:8a0:616a:50.57419 2600:1901:0:9e23.443   ESTABLISHED";
+
+    #[test]
+    fn parse_real_netstat_capture_counts_every_state() {
+        let c = parse_netstat_output(NETSTAT_SAMPLE);
+        assert_eq!(c.established, 3);
+        assert_eq!(c.listen, 2);
+        assert_eq!(c.time_wait, 1);
+        assert_eq!(c.close_wait, 1);
+        assert_eq!(c.other, 0);
+        assert_eq!(c.total, 7); // header/title/udp lines excluded
+    }
+
+    #[test]
+    fn loopback_pair_is_not_counted_as_incoming() {
+        let c = parse_netstat_output(NETSTAT_SAMPLE);
+        // 127.0.0.1.64342 <-> 127.0.0.1.57332 is two local processes
+        // talking to each other, not anyone connecting in from outside.
+        assert_eq!(c.incoming, 0);
+    }
+
+    #[test]
+    fn outgoing_established_connection_is_not_counted_as_incoming() {
+        // Neither TIME_WAIT/CLOSE_WAIT participate (only ESTABLISHED does),
+        // and the sample's one non-loopback ESTABLISHED row (the IPv6 one)
+        // has an ephemeral local port that isn't in the LISTEN set.
+        let c = parse_netstat_output(NETSTAT_SAMPLE);
+        assert_eq!(c.incoming, 0);
+    }
+
+    #[test]
+    fn established_connection_on_a_listen_port_from_a_real_peer_is_incoming() {
+        let sample = "\
+Proto Recv-Q Send-Q  Local Address                                 Foreign Address                               (state)
+tcp4       0      0  *.9090                 *.*                    LISTEN
+tcp4       0      0  192.168.1.10.9090      198.51.100.7.51000     ESTABLISHED";
+        let c = parse_netstat_output(sample);
+        assert_eq!(c.incoming, 1);
+    }
+
+    #[test]
+    fn established_connection_on_a_listen_port_from_loopback_is_not_incoming() {
+        let sample = "\
+Proto Recv-Q Send-Q  Local Address                                 Foreign Address                               (state)
+tcp4       0      0  *.9090                 *.*                    LISTEN
+tcp4       0      0  127.0.0.1.9090         127.0.0.1.51000        ESTABLISHED";
+        let c = parse_netstat_output(sample);
+        assert_eq!(c.incoming, 0);
+    }
+
+    #[test]
+    fn netstat_port_extracts_the_trailing_port() {
+        assert_eq!(netstat_port("127.0.0.1.64342"), Some("64342"));
+        assert_eq!(netstat_port("*.61118"), Some("61118"));
+        assert_eq!(netstat_port("2001:8a0:616a:50.57419"), Some("57419"));
+        assert_eq!(netstat_port("*.*"), None);
+    }
+
+    #[test]
+    fn is_loopback_recognizes_v4_and_v6() {
+        assert!(is_loopback("127.0.0.1.57332"));
+        assert!(is_loopback("::1.443"));
+        assert!(!is_loopback("93.184.216.34.443"));
+        assert!(!is_loopback("*.*"));
     }
 }

@@ -17,6 +17,13 @@ const LOW_DISK_AVAILABLE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 const LOW_BATTERY_PCT: u8 = 20;
 const RECENT_ALERTS_WINDOW: Duration = Duration::from_secs(5 * 60);
 const RECENT_ALERTS_CAPACITY: usize = 10;
+/// First-guess thresholds (see docs/decisions/0001-network-connection-monitoring.md)
+/// — not derived from a fleet baseline, just picked generously above what a
+/// single busy dev workstation showed in practice (~570 total connections
+/// observed live) and near-zero for genuine external inbound. Expect to
+/// tune both from real field data the way the other rules' thresholds were.
+const HIGH_CONNECTION_COUNT_THRESHOLD: u32 = 1500;
+const INCOMING_CONNECTIONS_THRESHOLD: u32 = 10;
 
 /// A short rolling log of every alert that fired recently (any key,
 /// including ones that never trigger an agent diagnosis on their own —
@@ -222,6 +229,38 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
         }
     }
 
+    if let Some(conn) = &snap.connections {
+        if conn.total > HIGH_CONNECTION_COUNT_THRESHOLD {
+            state.try_fire(
+                now,
+                cooldown,
+                "high_connection_count",
+                "vigil: high connection count",
+                format!(
+                    "{} open TCP connections ({} established, {} time_wait, {} close_wait) — well above the usual baseline. Suggestion: `lsof -i -n -P | awk '{{print $1}}' | sort | uniq -c | sort -rn` to see which process holds the most.",
+                    conn.total, conn.established, conn.time_wait, conn.close_wait
+                ),
+                None,
+                &mut alerts,
+            );
+        }
+
+        if conn.incoming > INCOMING_CONNECTIONS_THRESHOLD {
+            state.try_fire(
+                now,
+                cooldown,
+                "incoming_connections",
+                "vigil: unusual incoming connections",
+                format!(
+                    "{} external connections into a service this machine is running right now. Suggestion: `lsof -i -n -P | grep LISTEN` to see what's exposed, and confirm that's expected.",
+                    conn.incoming
+                ),
+                None,
+                &mut alerts,
+            );
+        }
+    }
+
     alerts
 }
 
@@ -298,7 +337,7 @@ fn osa_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DiskInfo, LoadAvg, MemoryInfo, ProcInfo, Snapshot};
+    use crate::{ConnectionCounts, DiskInfo, LoadAvg, MemoryInfo, ProcInfo, Snapshot};
 
     fn proc(pid: u32, name: &str, cpu_pct: f32, mem_mb: u64) -> ProcInfo {
         ProcInfo {
@@ -329,6 +368,7 @@ mod tests {
                 used_pct: 40.0,
             }],
             battery: None,
+            connections: None,
             top_cpu: vec![proc(1, "idle_app", 5.0, 100)],
             top_mem: vec![proc(1, "idle_app", 5.0, 100)],
         }
@@ -415,6 +455,64 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].key, "low_disk:/");
         assert!(alerts[0].message.contains('%'));
+    }
+
+    #[test]
+    fn high_connection_count_fires_with_state_breakdown_in_message() {
+        let mut snap = healthy_snapshot();
+        snap.connections = Some(ConnectionCounts {
+            established: 1800,
+            listen: 20,
+            time_wait: 30,
+            close_wait: 10,
+            other: 0,
+            total: 1860,
+            incoming: 0,
+        });
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].key, "high_connection_count");
+        assert!(alerts[0].message.contains("1860"));
+    }
+
+    #[test]
+    fn incoming_connections_fires_when_over_threshold() {
+        let mut snap = healthy_snapshot();
+        snap.connections = Some(ConnectionCounts {
+            established: 50,
+            listen: 5,
+            time_wait: 0,
+            close_wait: 0,
+            other: 0,
+            total: 55,
+            incoming: 25,
+        });
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].key, "incoming_connections");
+        assert!(alerts[0].message.contains("25"));
+    }
+
+    #[test]
+    fn normal_connection_counts_produce_no_network_alerts() {
+        let mut snap = healthy_snapshot();
+        snap.connections = Some(ConnectionCounts {
+            established: 200,
+            listen: 20,
+            time_wait: 10,
+            close_wait: 5,
+            other: 0,
+            total: 235,
+            incoming: 2,
+        });
+
+        let mut state = AlertState::new();
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        assert!(alerts.is_empty());
     }
 
     #[test]
