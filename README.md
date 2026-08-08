@@ -73,13 +73,24 @@ become an unrelated `bfs` scan. Process-targeted alerts (`high_load`/`swap_press
 synchronously, at the moment they fire, and hand it to the agent alongside the alert
 so a stale-by-the-time-you-check pid doesn't get misattributed.
 
-Repeat firings for the same process are treated as one ongoing incident, not a fresh
-one each time: `alerts::IncidentTracker` skips the notification, the diagnosis, and
-the journal entry for a target that already has one open (still firing within twice
-the alert cooldown of its last firing), and only starts a new incident once that
-target has been quiet for longer than that. A different process firing in the same
-window still gets its own full treatment — an incident is scoped to what it's
-actually about, not to a shared time window.
+Repeat firings are treated as one ongoing incident, not a fresh one each time:
+`alerts::IncidentTracker` skips the notification, the diagnosis, and the journal
+entry for a target that already has one open (still firing within twice the alert
+cooldown of its last firing), and only starts a new incident once that target has
+been quiet for longer than that. For `cpu_hog`/`high_process_count`, the alert is
+fundamentally about one specific process/group, so "target" means exactly that — a
+different process firing in the same window gets its own full treatment. For
+`high_load`/`swap_pressure`/`low_memory`/`battery_low`, which are about an aggregate
+system condition, "target" is a fixed sentinel instead of whichever process the
+message happens to cite as the top consumer — on a loaded machine that name rotates
+every few seconds (contactsd, then codex, then pycharm, ...) while the underlying
+condition is the same ongoing thing, and citing the rotating name as the dedup key
+used to defeat `IncidentTracker` almost entirely for these rules. `high_load` also
+requires the load average to stay above threshold continuously for 30s before firing
+at all, not just a fixed sentinel for dedup — `load_avg.one` is already a 1-minute
+OS-smoothed average, so this only filters a brief threshold-crossing right at the
+boundary, not real sample-to-sample noise. See
+[docs/decisions/0005-stable-incident-targets-and-sustained-high-load.md](docs/decisions/0005-stable-incident-targets-and-sustained-high-load.md).
 
 Battery ETA is a plain drain-rate extrapolation from the percentage vigil observes over
 time — there's no per-process power attribution (that needs `powermetrics

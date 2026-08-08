@@ -13,6 +13,9 @@ const SWAP_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
 const LOW_FREE_MEM_RATIO: f64 = 0.05;
 const CPU_HOG_THRESHOLD_PCT: f32 = 90.0;
 const CPU_HOG_STREAK_REQUIRED: u32 = 3;
+/// How long `load_avg.one` must stay above threshold, continuously, before
+/// `high_load` actually fires — see `AlertState::high_load_since`.
+const HIGH_LOAD_SUSTAINED_DURATION: Duration = Duration::from_secs(30);
 const LOW_DISK_AVAILABLE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 const LOW_BATTERY_PCT: u8 = 20;
 const RECENT_ALERTS_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -111,11 +114,24 @@ pub struct Alert {
     pub key: String,
     pub title: String,
     pub message: String,
-    /// The process this alert is about, if any (e.g. `pycharm`) — set from
-    /// the same `ProcInfo` the message text was built from, rather than
-    /// parsed back out of the rendered message. Lets callers (see
-    /// `IncidentTracker`) recognize "different alert, same underlying
-    /// process" without brittle text scraping.
+    /// What `IncidentTracker` dedups repeat firings of this alert by.
+    /// **Not** always literally "the process" despite the name: for a rule
+    /// that's fundamentally *about* one specific process (`cpu_hog:<pid>`,
+    /// `high_process_count:<name>`), this is that process's name, so a
+    /// genuinely different process triggering the same rule still gets its
+    /// own incident. For a rule about an aggregate system condition
+    /// (`high_load`, `swap_pressure`, `low_memory`, `battery_low`) — where
+    /// the message names a "top consumer" only as a diagnostic hint, not
+    /// the actual subject — this is a fixed sentinel (the rule's own key)
+    /// instead. Live data showed why: on a loaded machine the CPU/memory
+    /// top consumer legitimately rotates every few seconds (contactsd, then
+    /// codex, then pycharm, ...) while the underlying condition is the same
+    /// ongoing thing; using the rotating name as the dedup key defeated
+    /// `IncidentTracker` almost entirely for these rules — nearly every
+    /// firing read as "different target" and got a fresh notification +
+    /// agent diagnosis, even minutes apart. A fixed sentinel fixes that
+    /// without touching the message text, which still names the actual top
+    /// consumer for whoever reads it.
     pub target: Option<String>,
     /// The full command line of `target`, captured from the same `ProcInfo`
     /// at the moment this alert fired — not re-looked-up later. A
@@ -182,6 +198,16 @@ impl IncidentTracker {
 pub struct AlertState {
     last_fired: HashMap<String, Instant>,
     cpu_hog_streak: HashMap<u32, u32>,
+    /// When `load_avg.one` first crossed the threshold in the current
+    /// streak, or `None` while it's under threshold. `high_load` only
+    /// actually fires once this has held for `HIGH_LOAD_SUSTAINED_DURATION`
+    /// — `load_avg.one` is already a 1-minute OS-smoothed average (not
+    /// noisy sample-to-sample the way instantaneous CPU% is), but it can
+    /// still cross the threshold only briefly right at the boundary; this
+    /// filters that out the same way `cpu_hog_streak` filters a one-off CPU
+    /// spike, just duration-based instead of sample-count-based so it
+    /// doesn't depend on `--interval`.
+    high_load_since: Option<Instant>,
 }
 
 impl AlertState {
@@ -189,6 +215,7 @@ impl AlertState {
         Self {
             last_fired: HashMap::new(),
             cpu_hog_streak: HashMap::new(),
+            high_load_since: None,
         }
     }
 
@@ -284,21 +311,32 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
 
     let load_threshold = (cpu_count.max(1) as f64) * 1.5;
     if snap.load_avg.one > load_threshold {
-        if let Some(top) = snap.top_cpu.first() {
-            state.try_fire(
-                now,
-                cooldown,
-                "high_load",
-                "vigil: high load",
-                format!(
-                    "Load average {:.1} (threshold {:.1} for {} cores). Top consumer: {} ({:.0}% CPU).{} Suggestion: check the process and restart it if needed.",
-                    snap.load_avg.one, load_threshold, cpu_count, top.name, top.cpu_pct, self_process_note(&top.name)
-                ),
-                Some(&top.name),
-                Some(&top.cmd),
-                &mut alerts,
-            );
+        let since = *state.high_load_since.get_or_insert(now);
+        let sustained = now.duration_since(since) >= HIGH_LOAD_SUSTAINED_DURATION;
+        if sustained {
+            if let Some(top) = snap.top_cpu.first() {
+                state.try_fire(
+                    now,
+                    cooldown,
+                    "high_load",
+                    "vigil: high load",
+                    format!(
+                        "Load average {:.1} (threshold {:.1} for {} cores). Top consumer: {} ({:.0}% CPU).{} Suggestion: check the process and restart it if needed.",
+                        snap.load_avg.one, load_threshold, cpu_count, top.name, top.cpu_pct, self_process_note(&top.name)
+                    ),
+                    // Stable sentinel, not `top.name` -- see Alert::target's
+                    // doc comment. The top CPU consumer legitimately rotates
+                    // every few seconds on a loaded machine; this rule is
+                    // about load average, not about whichever process
+                    // happens to be busiest in this one sample.
+                    Some("high_load"),
+                    Some(&top.cmd),
+                    &mut alerts,
+                );
+            }
         }
+    } else {
+        state.high_load_since = None;
     }
 
     if snap.memory.swap_used_bytes > SWAP_THRESHOLD_BYTES {
@@ -313,7 +351,9 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                     snap.memory.swap_used_bytes as f64 / 1e9,
                     format_mem_consumer(top, &snap.top_mem_groups)
                 ),
-                Some(&top.name),
+                // Stable sentinel -- see Alert::target's doc comment and the
+                // matching high_load comment above.
+                Some("swap_pressure"),
                 Some(&top.cmd),
                 &mut alerts,
             );
@@ -334,7 +374,8 @@ pub fn evaluate(snap: &Snapshot, cpu_count: usize, state: &mut AlertState, coold
                         free_ratio * 100.0,
                         format_mem_consumer(top, &snap.top_mem_groups)
                     ),
-                    Some(&top.name),
+                    // Stable sentinel -- see Alert::target's doc comment.
+                    Some("low_memory"),
                     Some(&top.cmd),
                     &mut alerts,
                 );
@@ -490,7 +531,9 @@ pub fn evaluate_battery(
         )
     });
 
-    let target = snap.top_cpu.first().map(|p| p.name.as_str());
+    // Stable sentinel -- see Alert::target's doc comment. The CPU hint
+    // above names whoever's heaviest right now purely as a lever
+    // suggestion; it's not what this alert is about.
     let command = snap.top_cpu.first().map(|p| p.cmd.as_str());
     let mut alerts = Vec::new();
     state.try_fire(
@@ -499,7 +542,7 @@ pub fn evaluate_battery(
         "battery_low",
         "vigil: low battery",
         format!("Battery at {pct}%, discharging, ~{eta_str} remaining.{top_hint}"),
-        target,
+        Some("battery_low"),
         command,
         &mut alerts,
     );
@@ -602,11 +645,15 @@ mod tests {
         // `top_cpu` isn't guaranteed non-empty by anything -- `evaluate`
         // takes an arbitrary `Snapshot` -- so a threshold breach with
         // nothing to name as the top consumer must be a no-op, not a panic.
+        // Sustained past HIGH_LOAD_SUSTAINED_DURATION to actually reach the
+        // top_cpu.first() branch, not just the not-sustained-yet no-op.
         let mut snap = healthy_snapshot();
         snap.load_avg.one = 100.0;
         snap.top_cpu = vec![];
         let mut state = AlertState::new();
-        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), Instant::now());
+        let t0 = Instant::now();
+        evaluate(&snap, 8, &mut state, Duration::from_secs(300), t0);
+        let alerts = evaluate(&snap, 8, &mut state, Duration::from_secs(300), t0 + HIGH_LOAD_SUSTAINED_DURATION);
         assert!(alerts.iter().all(|a| a.key != "high_load"));
     }
 
@@ -650,33 +697,73 @@ mod tests {
     fn high_load_fires_and_then_respects_cooldown() {
         let mut snap = healthy_snapshot();
         snap.load_avg.one = 50.0;
-        snap.top_cpu = vec![proc(42, "hog", 95.0, 500)];
+        snap.top_cpu = vec![proc(42, "hog", 50.0, 500)];
 
         let mut state = AlertState::new();
-        let now = Instant::now();
-        let first = evaluate(&snap, 4, &mut state, Duration::from_secs(300), now);
+        let t0 = Instant::now();
+        assert!(evaluate(&snap, 4, &mut state, Duration::from_secs(300), t0).is_empty());
+
+        let t1 = t0 + HIGH_LOAD_SUSTAINED_DURATION;
+        let first = evaluate(&snap, 4, &mut state, Duration::from_secs(300), t1);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].key, "high_load");
         assert!(first[0].message.contains("hog"));
         assert_eq!(first[0].command.as_deref(), Some("hog"));
 
-        let second = evaluate(&snap, 4, &mut state, Duration::from_secs(300), now);
-        assert!(second.is_empty(), "second call within cooldown must not re-fire");
+        let second = evaluate(&snap, 4, &mut state, Duration::from_secs(300), t1);
+        assert!(second.is_empty());
     }
 
     #[test]
     fn high_load_refires_after_cooldown_elapses() {
         let mut snap = healthy_snapshot();
         snap.load_avg.one = 50.0;
-        snap.top_cpu = vec![proc(42, "hog", 95.0, 500)];
+        snap.top_cpu = vec![proc(42, "hog", 50.0, 500)];
 
         let mut state = AlertState::new();
         let t0 = Instant::now();
         let cooldown = Duration::from_millis(10);
-        assert_eq!(evaluate(&snap, 4, &mut state, cooldown, t0).len(), 1);
+        evaluate(&snap, 4, &mut state, cooldown, t0); // starts the sustained-duration clock only
+        let t_sustained = t0 + HIGH_LOAD_SUSTAINED_DURATION;
+        assert_eq!(evaluate(&snap, 4, &mut state, cooldown, t_sustained).len(), 1);
 
-        let t1 = t0 + Duration::from_millis(20);
+        let t1 = t_sustained + Duration::from_millis(20);
         assert_eq!(evaluate(&snap, 4, &mut state, cooldown, t1).len(), 1);
+    }
+
+    #[test]
+    fn high_load_does_not_fire_for_a_brief_spike_under_the_sustained_duration() {
+        let mut snap = healthy_snapshot();
+        snap.load_avg.one = 50.0;
+        snap.top_cpu = vec![proc(42, "hog", 95.0, 500)];
+
+        let mut state = AlertState::new();
+        let t0 = Instant::now();
+        assert!(evaluate(&snap, 4, &mut state, Duration::from_secs(300), t0).is_empty());
+
+        let t1 = t0 + HIGH_LOAD_SUSTAINED_DURATION - Duration::from_secs(1);
+        assert!(evaluate(&snap, 4, &mut state, Duration::from_secs(300), t1).is_empty());
+    }
+
+    #[test]
+    fn high_load_streak_resets_once_load_drops_back_down() {
+        let mut snap = healthy_snapshot();
+        snap.load_avg.one = 50.0;
+        snap.top_cpu = vec![proc(42, "hog", 50.0, 500)];
+
+        let mut state = AlertState::new();
+        let t0 = Instant::now();
+        evaluate(&snap, 4, &mut state, Duration::from_secs(300), t0);
+
+        // Load drops back under threshold -- resets the sustained-since clock.
+        snap.load_avg.one = 1.0;
+        evaluate(&snap, 4, &mut state, Duration::from_secs(300), t0 + Duration::from_secs(10));
+
+        // Load spikes again -- shouldn't fire immediately just because the
+        // *original* crossing was more than HIGH_LOAD_SUSTAINED_DURATION ago.
+        snap.load_avg.one = 50.0;
+        let t2 = t0 + HIGH_LOAD_SUSTAINED_DURATION + Duration::from_secs(1);
+        assert!(evaluate(&snap, 4, &mut state, Duration::from_secs(300), t2).is_empty());
     }
 
     #[test]
@@ -978,7 +1065,9 @@ mod tests {
         snap.load_avg.one = 50.0;
         snap.top_cpu = vec![proc(1, "vigil", 61.0, 40)];
         let mut state = AlertState::new();
-        let alerts = evaluate(&snap, 4, &mut state, Duration::from_secs(300), Instant::now());
+        let t0 = Instant::now();
+        evaluate(&snap, 4, &mut state, Duration::from_secs(300), t0);
+        let alerts = evaluate(&snap, 4, &mut state, Duration::from_secs(300), t0 + HIGH_LOAD_SUSTAINED_DURATION);
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].message.contains("vigil's own process"));
     }
