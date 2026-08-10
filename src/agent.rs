@@ -78,6 +78,50 @@ pub(crate) fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
         || alert_key.starts_with("high_process_count:")
 }
 
+/// Builds the notification `Alert` for a just-fired incident: the message
+/// now points at the explicit opt-in investigate command instead of
+/// promising a diagnosis that no longer happens automatically. `watch_log`
+/// is included in the hinted command when the caller has one (`vigil
+/// watch` does; `vigil ui`'s own snapshot loop doesn't — see its call
+/// site) so the eventual `vigil investigate` run can still check trend
+/// history, not just the one snapshot at alert-fire time. Pure —
+/// everything else about `alert` is carried through unchanged.
+pub(crate) fn augment_with_investigate_hint(
+    alert: &crate::alerts::Alert,
+    watch_log_path: Option<&str>,
+) -> crate::alerts::Alert {
+    let hint = match watch_log_path {
+        Some(p) => format!("`vigil investigate {} --watch-log {p}`", alert.key),
+        None => format!("`vigil investigate {}`", alert.key),
+    };
+    crate::alerts::Alert {
+        key: alert.key.clone(),
+        title: alert.title.clone(),
+        message: format!("{} — investigate? {hint}", alert.message),
+        target: alert.target.clone(),
+        command: alert.command.clone(),
+    }
+}
+
+/// Pure argv construction for `vigil-agent execute`, the execute-agent
+/// invocation `fix_process::run` spawns after the user approves a plan —
+/// mirrors `build_args`'s split from the actual `Command` spawn.
+/// `plan_json` is the JSON array of *already-approved* steps only (see
+/// `fixplan::approved_steps_json`) — the execute-agent never receives the
+/// rejected ones.
+pub(crate) fn build_execute_args(plan_json: &str, agent_dir: &str) -> Vec<String> {
+    vec![
+        "uv".to_string(),
+        "run".to_string(),
+        "--project".to_string(),
+        agent_dir.to_string(),
+        "vigil-agent".to_string(),
+        "execute".to_string(),
+        "--plan-json".to_string(),
+        plan_json.to_string(),
+    ]
+}
+
 /// A short, single-paragraph preview of a (possibly multi-paragraph)
 /// diagnosis, for the notification banner — the full text goes to the
 /// incident journal file instead, which is what `message` here points at.
@@ -258,6 +302,49 @@ mod tests {
         assert!(!is_auto_diagnose_worthy("low_disk:/"));
         assert!(!is_auto_diagnose_worthy("low_memory"));
         assert!(!is_auto_diagnose_worthy("swap_pressure"));
+    }
+
+    #[test]
+    fn augment_with_investigate_hint_appends_the_command_and_keeps_other_fields() {
+        let alert = crate::alerts::Alert {
+            key: "cpu_hog:37489".to_string(),
+            title: "vigil: process hogging CPU".to_string(),
+            message: "pycharm (pid 37489) has held 204% CPU".to_string(),
+            target: Some("pycharm".to_string()),
+            command: Some("/Applications/PyCharm.app/Contents/MacOS/pycharm".to_string()),
+        };
+        let augmented = augment_with_investigate_hint(&alert, Some("/Users/denis/.vigil/watch.jsonl"));
+        assert!(augmented.message.contains("pycharm (pid 37489) has held 204% CPU"));
+        assert!(augmented.message.contains("vigil investigate cpu_hog:37489"));
+        assert!(augmented.message.contains("--watch-log /Users/denis/.vigil/watch.jsonl"));
+        assert_eq!(augmented.key, alert.key);
+        assert_eq!(augmented.title, alert.title);
+        assert_eq!(augmented.target, alert.target);
+        assert_eq!(augmented.command, alert.command);
+    }
+
+    #[test]
+    fn augment_with_investigate_hint_omits_watch_log_flag_when_none() {
+        let alert = crate::alerts::Alert {
+            key: "high_load".to_string(),
+            title: "vigil: high load".to_string(),
+            message: "Load average 25.0".to_string(),
+            target: Some("high_load".to_string()),
+            command: None,
+        };
+        let augmented = augment_with_investigate_hint(&alert, None);
+        assert!(!augmented.message.contains("--watch-log"));
+        assert!(augmented.message.contains("vigil investigate high_load"));
+    }
+
+    #[test]
+    fn build_execute_args_wires_project_dir_and_plan_json() {
+        let args = build_execute_args(r#"[{"category":"kill_process"}]"#, "agent");
+        assert_eq!(args[0], "uv");
+        assert_eq!(args[1], "run");
+        assert!(args.windows(2).any(|w| w == ["--project".to_string(), "agent".to_string()]));
+        assert_eq!(args.last().unwrap(), r#"[{"category":"kill_process"}]"#);
+        assert!(args.contains(&"execute".to_string()));
     }
 
     fn output_with(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
