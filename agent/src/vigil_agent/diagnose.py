@@ -22,11 +22,15 @@ from .prompts import SYSTEM_PROMPT, build_prompt
 ALLOWED_TOOLS = ["Bash", "Read", "Grep", "Glob"]
 
 # Command-pattern denylist on top of the allowlist above. This runs for
-# BOTH the interactive ('a' key) and the automatic background CPU-alert
-# diagnosis (see agent.rs::maybe_diagnose_alert_async) — the background
-# path has no one watching, so these rails apply unconditionally, not just
-# when unattended. Investigation must stay read-only: no killing processes,
-# no deleting/moving files, no privilege escalation, no power state changes.
+# BOTH the interactive ('a' key) ask and `vigil investigate` — both go
+# through this same ask() function. Even though `vigil investigate` is now
+# a deliberate user action rather than a background thread, these rails
+# still apply unconditionally, not just when unattended: a background or
+# scripted invocation (e.g. triggered from a notification action, or run
+# from a script) has no one watching the output in real time either, same
+# reasoning as before. Investigation must stay read-only: no killing
+# processes, no deleting/moving files, no privilege escalation, no power
+# state changes.
 DISALLOWED_TOOLS = [
     "Write",
     "Edit",

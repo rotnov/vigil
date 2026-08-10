@@ -19,25 +19,59 @@ it moves the machine toward or away from this, including the cost vigil itself a
 ## Core architectural rule: Rust never decides or fixes anything
 
 - `src/*.rs` only collects metrics (no network calls, no LLM) and, in `alerts.rs`,
-  evaluates fixed cheap thresholds — it never reasons about *why* something is wrong.
-- Diagnosis and recommendations live only in `agent/` (Python, Claude Agent SDK),
-  reached via `src/agent.rs` shelling out to `uv run vigil-agent ask`.
-- The agent may *inspect* the live system (Bash/Read/Grep/Glob — logs, `sample`,
-  `vm_stat`, `du`, `pmset -g therm`, ...) but is blocked at the tool level from
-  modifying it, identically whether it's the interactive `a`-key ask in `vigil ui` or
-  an auto-triggered background diagnosis — same contract, same
-  `agent/src/vigil_agent/diagnose.py` config either way:
+  evaluates fixed cheap thresholds — it never reasons about *why* something is
+  wrong, and never decides *whether* a fix is safe. Diagnosis, fix proposals, and
+  fix execution all live only in `agent/` (Python, Claude Agent SDK), reached via
+  `src/agent_process.rs` shelling out to `uv run vigil-agent ask` / `uv run
+  vigil-agent execute`.
+- Investigation is opt-in, not automatic: an alert firing notifies with the command
+  to run, `vigil investigate <alert-key>`, and — only for alert keys
+  `agent::is_journal_worthy` returns true for (`high_load`, `cpu_hog:*`,
+  `battery_low`, `high_process_count:*`) — also writes a stub incident file
+  (`incidents::write_stub`: title, alert key, rule message, nothing else); other
+  keys (disk/connection/memory-pressure alerts have no dedup key and would fire
+  unboundedly) get only the plain notification, same as before this whole plan. No
+  agent process spawns until the user explicitly runs that command.
+- `vigil investigate` runs the same read-only investigation agent as the
+  interactive `a`-key ask in `vigil ui` — identical contract either way, same
+  `agent/src/vigil_agent/diagnose.py` config:
   - `ALLOWED_TOOLS`: `Bash`, `Read`, `Grep`, `Glob` only.
-  - `DISALLOWED_TOOLS` always includes `Write`, `Edit`, `NotebookEdit`, plus a Bash
-    denylist covering destructive/privilege-escalating patterns: `sudo *`, `su *`,
-    `rm *`, `rmdir *`, `mv *`, `dd *`, `kill *`, `killall *`, `pkill *`, `diskutil
+  - `DISALLOWED_TOOLS` always includes `Write`, `Edit`, `NotebookEdit`, plus the
+    full destructive/privilege-escalating Bash denylist: `sudo *`, `su *`, `rm *`,
+    `rmdir *`, `mv *`, `dd *`, `kill *`, `killall *`, `pkill *`, `diskutil
     erase*`/`partition*`/`eraseVolume*`, `launchctl unload*`/`bootout*`/`remove*`,
     `chmod *`, `chown *`, `shutdown *`, `reboot *`, `halt *`, `defaults
     write*`/`delete*`.
-  - It only ever produces text — nothing on the machine changes without the user
-    doing it themselves. Any risky suggestion is framed as needing explicit user
-    confirmation, never phrased or executed as already-done.
-  - Never relax this list to let the agent execute a fix directly, in either flow.
+  - It only ever produces text — nothing on the machine changes from this path. If
+    it identifies a specific, narrowly-scoped, low-risk fix, it may additionally
+    append a `## Proposed fix` JSON block (schema in `prompts.py`'s
+    `SYSTEM_PROMPT`) — a proposal, not an action.
+- A `## Proposed fix` only ever executes through `vigil fix <incident-file>`, and
+  only after per-step interactive approval in the terminal (`fix_process::run`).
+  Approved steps — and *only* the approved ones; a rejected step is never even
+  mentioned to the execute-agent — are handed to a **separate**, narrowly-scoped
+  execute-agent session (`agent/src/vigil_agent/execute.py`), whose tool config is
+  built fresh per invocation from exactly the fix categories present in what was
+  approved:
+  - `kill_process` unlocks `Bash(kill *)`/`Bash(killall *)`/`Bash(pkill *)`.
+  - `delete_path` unlocks `Bash(rm *)`/`Bash(rmdir *)`/`Bash(mv *)`.
+  - `system_setting` unlocks `Bash(defaults write*)`/`Bash(defaults delete*)`/
+    `Bash(launchctl unload*)`/`Bash(launchctl bootout*)`/`Bash(launchctl remove*)`.
+  - A **non-liftable hard floor** stays blocked regardless of what's approved —
+    outside all three categories, no plan can ever unlock it:
+    `execute.HARD_FLOOR_DISALLOWED_TOOLS` (`sudo`/`su`/`dd`/`diskutil
+    erase`-family/`shutdown`/`reboot`/`halt`/`chmod`/`chown`, plus
+    `Write`/`Edit`/`NotebookEdit` — the execute-agent acts only through unlocked
+    Bash patterns, never by writing/editing files directly).
+  - The execute-agent must re-verify a step's target before acting (a
+    pid/path/setting captured at proposal time may be stale by execution time —
+    see `agent::build_diagnosis_question`'s doc comment for a real pid-reuse race
+    this project already hit) and must abort all remaining steps the moment one
+    fails or its target has diverged, rather than continuing on a plan whose
+    assumptions no longer hold.
+  - Never widen `HARD_FLOOR_DISALLOWED_TOOLS`, never let a category unlock more
+    than its own listed patterns, and never let `vigil fix` run *any* step the user
+    didn't explicitly approve.
 - Battery: percentage-trend ETA only (`src/battery.rs`), no `powermetrics`/sudo — a
   deliberate, explicit choice, not an oversight. If accurate per-process power
   attribution is ever wanted, that's a new decision (record it under
@@ -86,20 +120,21 @@ it moves the machine toward or away from this, including the cost vigil itself a
   threshold constant near the top of the file, and tests built on the file's
   `healthy_snapshot()` fixture — not a new ad hoc pattern per rule.
 - **Hard rule: `cargo llvm-cov --workspace --ignore-filename-regex
-  'src/(main|watch|ui_loop|menubar_loop|agent_process|notify)\.rs' --fail-under-lines
-  99.5 --fail-under-regions 98`.** This is a merge invariant, not an aspiration — treat
+  'src/(main|watch|ui_loop|menubar_loop|agent_process|notify|investigate_process|fix_process)\.rs'
+  --fail-under-lines 99.5 --fail-under-regions 98`.** This is a merge invariant, not an aspiration — treat
   a change that drops below it the same as a failing test. As of 2026-08-07 this is
   met (99.5%+ lines, stable across repeated runs — see
   [docs/decisions/0003-coverage-gate-glue-isolation.md](docs/decisions/0003-coverage-gate-glue-isolation.md)
   for the full story of closing the gap from an earlier 73.44%, including why the
   original 99.9% target was revised: the remaining shortfall is `assert!` panic-message
   arguments, a known source-coverage artifact on test code, not untested behavior).
-  - The six `--ignore-filename-regex` files hold *only* irreducible OS-boundary glue
-    (a real terminal event loop, a real macOS tray event loop, a real process spawn) —
-    each has a doc comment explaining why. Adding new logic to one of them is a smell;
-    extract a pure function into the file it's gluing together instead, the same way
-    `agent.rs`/`ui.rs`/`menubar.rs`/`alerts.rs` already keep their tested logic
-    separate from `agent_process.rs`/`ui_loop.rs`/`menubar_loop.rs`/`notify.rs`.
+  - The eight `--ignore-filename-regex` files hold *only* irreducible OS-boundary
+    glue (a real terminal event loop, a real macOS tray event loop, three real
+    process spawns) — each has a doc comment explaining why. Adding new logic to one
+    of them is a smell; extract a pure function into the file it's gluing together
+    instead, the same way `agent.rs`/`ui.rs`/`menubar.rs`/`alerts.rs` already keep
+    their tested logic separate from
+    `agent_process.rs`/`ui_loop.rs`/`menubar_loop.rs`/`notify.rs`/`investigate_process.rs`/`fix_process.rs`.
   - `#[coverage(off)]` is NOT an option here — confirmed experimental/nightly-only on
     this project's stable toolchain (rustc 1.88.0). Don't rediscover that; use the
     file-isolation pattern above, or `coverage.py`'s `exclude_also`/`omit` on the
@@ -113,12 +148,17 @@ it moves the machine toward or away from this, including the cost vigil itself a
     tested, check whether it's actually *unreachable* (like `collect_disks`'s old
     `total > 0 else 0.0` branch, dead once the upstream `.filter()` is accounted for)
     — simplify those away instead of exempting them.
-  - Because `cargo test` cannot exercise the six excluded files, a change touching any
-    of them needs a manual smoke run before merging: `vigil snapshot | jq .`, `vigil
-    watch --count 2 --out /tmp/x.jsonl` (check the JSONL line and that the status file
-    got written), `vigil incidents` + `vigil incidents --show <name>` (check `echo $?`
-    on both a match and a miss — `Commands::Incidents` goes through
-    `std::process::exit`), and `vigil menubar` launched briefly and killed.
+  - Because `cargo test` cannot exercise the eight excluded files, a change touching
+    any of them needs a manual smoke run before merging: `vigil snapshot | jq .`,
+    `vigil watch --count 2 --out /tmp/x.jsonl` (check the JSONL line and that the
+    status file got written), `vigil incidents` + `vigil incidents --show <name>`
+    (check `echo $?` on both a match and a miss — `Commands::Incidents` goes through
+    `std::process::exit`), `vigil menubar` launched briefly and killed, `vigil
+    investigate <key>` against a hand-written stub incident file (spends real agent
+    tokens — see the Testing section's Python bullet for the equivalent
+    `vigil-agent execute --help` check), and `vigil fix <file>` against an incident
+    with a `## Proposed fix` block, approving then rejecting a step to confirm both
+    paths.
 
 ## Decisions (ADRs)
 
@@ -141,36 +181,50 @@ it moves the machine toward or away from this, including the cost vigil itself a
 
 ## The live incident-monitoring loop
 
-- `vigil watch` runs continuously in the background; `alerts.rs` auto-triggers a
-  background agent diagnosis for `high_load`/`cpu_hog:*`/`battery_low` (disk and plain
-  memory-pressure alerts don't — see `agent::is_auto_diagnose_worthy`). Every
-  auto-triggered diagnosis is journaled to
-  `~/.vigil/incidents/<date>-<time>-<slug>.md` — a fixed, home-relative path (vigil is
-  meant to run from anywhere, not just its own repo). The interactive `a`-key ask in
-  `vigil ui` is deliberately NOT journaled — on-screen only, by design.
+- `vigil watch` runs continuously in the background; an alert firing notifies with the
+  exact command to investigate it — `vigil investigate <alert-key>` — but does not
+  itself spawn an agent. Only alert keys `agent::is_journal_worthy` returns true for
+  (`high_load`, `cpu_hog:*`, `battery_low`, `high_process_count:*`) also get a stub
+  incident file (`incidents::write_stub`); other keys (disk/connection/
+  memory-pressure alerts) fire a plain notification only, same as before this whole
+  plan. Every incident file that does get written lives at
+  `~/.vigil/incidents/<date>-<time>-<slug>.md` — a fixed, home-relative path (vigil
+  is meant to run from anywhere, not just its own repo). The interactive `a`-key ask
+  in `vigil ui` is deliberately NOT journaled — on-screen only, by design.
 - `vigil incidents` reads that journal from a plain shell (list recent, or `--show
   <name>` for one in full) — this exists specifically because a push notification
   can't spontaneously open an already-running `vigil ui` session.
-- When real incidents land, read them, look for a genuine pattern across more than one
-  (not a single anecdote), and treat a confirmed pattern as a legitimate case for a
-  targeted vigil improvement — this is the actual mechanism this project uses to find
-  bugs and gaps in itself, not a hypothetical. Verify a proposed fix against the
-  *actual* field data before shipping it, not just against the pattern that motivated
-  it: an initial narrow fix (`agent::DiagnosisCoalescer`, a 120s near-simultaneous
-  window keyed by target process) was itself later found to never actually engage —
-  real repeats arrived 5-13 minutes apart, gated by each rule's own re-fire cooldown,
-  not by anything a 120s window could catch. It was replaced by
-  `alerts::IncidentTracker`, a longer open/close window (2x cooldown) keyed the same
-  way (by target process, not by time alone — the earlier design's own reasoning for
-  that part held up: the same live incident batch that motivated coalescing also
-  contained a genuinely independent finding a *time-only* cooldown would have silently
-  dropped) and covering notification + diagnosis + journal together, not diagnosis
-  alone. Re-verify a fix like this against fresh field data after shipping it, not just
-  once at design time — this project's own history is the example.
-- Never let this loop, or any alert/diagnosis path, auto-execute anything the incident
-  data suggests — it stays investigate → journal → notify → (human decides). This is
-  the same rule as the tool-access one above, restated because it's the thing this
-  whole feature exists to not violate.
+- When real incidents land, read them, look for a genuine pattern across more than
+  one (not a single anecdote), and treat a confirmed pattern as a legitimate case
+  for a targeted vigil improvement — this is the actual mechanism this project uses
+  to find bugs and gaps in itself, not a hypothetical. Verify a proposed fix
+  against the *actual* field data before shipping it, not just against the pattern
+  that motivated it: an initial narrow fix (`agent::DiagnosisCoalescer`, a 120s
+  near-simultaneous window keyed by target process) was itself later found to
+  never actually engage — real repeats arrived 5-13 minutes apart, gated by each
+  rule's own re-fire cooldown, not by anything a 120s window could catch. It was
+  replaced by `alerts::IncidentTracker`, a longer open/close window (2x cooldown)
+  keyed the same way (by target process, not by time alone — the earlier design's
+  own reasoning for that part held up: the same live incident batch that motivated
+  coalescing also contained a genuinely independent finding a *time-only* cooldown
+  would have silently dropped) and covering notification + the incident stub
+  together — diagnosis timing itself is opt-in now and outside `IncidentTracker`'s
+  concern entirely. Re-verify a fix like this against fresh field data after
+  shipping it, not just once at design time — this project's own history is the
+  example.
+- Running a fix through `vigil fix` never marks an incident resolved by itself —
+  `IncidentTracker`'s open/closed state stays driven purely by whether the alert
+  keeps re-firing, unrelated to whether a fix was proposed or run. "The agent
+  reports it took an action" and "the underlying condition actually cleared" are
+  different claims; conflating them would let a failed or partially-effective fix
+  read as resolved when the next snapshot might show the same alert firing again
+  minutes later.
+- Nothing on the machine changes except through the explicit `vigil investigate` →
+  `vigil fix` path described in the "Core architectural rule" section above, and
+  never without the human approving the specific plan first. This loop stays
+  investigate (opt-in) → propose (opt-in, agent's judgment) → approve (human,
+  per-step) → execute (narrowly-scoped agent) → journal — never a shortcut around
+  any of those steps.
 
 ## Git workflow
 
