@@ -3,6 +3,7 @@ mod agent_process;
 mod alerts;
 mod battery;
 mod cli;
+mod fixplan;
 mod incidents;
 mod incidents_cmd;
 mod menubar;
