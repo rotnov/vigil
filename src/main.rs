@@ -6,6 +6,7 @@ mod cli;
 mod fixplan;
 mod incidents;
 mod incidents_cmd;
+mod investigate;
 mod menubar;
 mod menubar_loop;
 mod notify;
