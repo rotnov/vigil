@@ -1,13 +1,15 @@
 //! Persists incident data to a local markdown journal —
 //! `<dir>/<date>-<time>-<slug>.md`, one file per alert-worthy incident.
 //!
-//! An alert firing writes a stub immediately (`write_stub`): title, alert
-//! key, rule message only, no diagnosis yet. `vigil investigate <key>`
-//! appends a `## Agent diagnosis` section later (`append_diagnosis`), and
-//! `vigil fix <file>` appends a `## Fix execution` section after that
-//! (`append_fix_execution`) if the diagnosis proposed one. Nothing here
-//! runs automatically — see `investigate_process.rs`/`fix_process.rs` for
-//! what calls these functions and when.
+//! A new incident on a journal-worthy alert (see `agent::is_journal_worthy`
+//! — not every firing alert key qualifies, to keep this journal bounded)
+//! writes a stub immediately (`write_stub`): title, alert key, rule message
+//! only, no diagnosis yet. `vigil investigate <key>` appends a `## Agent
+//! diagnosis` section later (`append_diagnosis`), and `vigil fix <file>`
+//! appends a `## Fix execution` section after that (`append_fix_execution`)
+//! if the diagnosis proposed one. Nothing here runs automatically — see
+//! `investigate_process.rs`/`fix_process.rs` for what calls these
+//! functions and when.
 //!
 //! Only alert-fired incidents are logged here — the interactive 'a'/'w'
 //! flow in the UI is deliberately not, it stays on-screen only.

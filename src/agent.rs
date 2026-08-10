@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 pub use crate::agent_process::ask;
 
-/// Builds the question sent to the agent for an auto-triggered diagnosis.
+/// Builds the question `vigil investigate` sends to the agent.
 /// Pure — kept separate from `investigate_process::run`'s side effects so
 /// the exact wording (cross-alert context, the watch-log pointer, the
 /// pid-reuse warning) is unit-testable without spawning anything.
@@ -25,8 +25,8 @@ pub use crate::agent_process::ask;
 /// history to point at (e.g. `vigil ui`'s own snapshot loop doesn't write
 /// one — only `vigil watch` does). `command` is `Alert::command` — the
 /// target process's full command line, captured synchronously at the
-/// moment the alert fired (see that field's doc comment for why: this
-/// diagnosis runs seconds to minutes later, in the background, and by then
+/// moment the alert fired (see that field's doc comment for why: a `vigil
+/// investigate` run may happen seconds to minutes after firing, and by then
 /// the OS may have recycled the pid to a completely different process).
 pub(crate) fn build_diagnosis_question(
     alert_message: &str,
@@ -60,6 +60,33 @@ pub(crate) fn build_diagnosis_question(
          the likely cause — check beyond the snapshot if useful (e.g. logs, `sample` a hot pid, \
          thermal state) — and suggest what to check or do next."
     )
+}
+
+/// Alert keys worth writing a permanent incident-journal stub for (see
+/// `incidents::write_stub`): CPU spikes (by the time you'd type a question,
+/// the spike may already be gone), low battery (root-causing a drain
+/// benefits from a written record plus a later `vigil investigate` run
+/// actually checking thermal state / recent high-CPU history), and
+/// unusually many idle instances of one process (confirming these are
+/// actually leaked/safe to kill — not e.g. a worker pool doing real, bursty
+/// background work — is worth a permanent record, the same way a CPU spike
+/// is). Disk, connection-count, and plain memory-pressure alerts still get
+/// a plain notification (`alerts::notify`, no journal entry) — this gate
+/// exists because, without it, targetless alerts like `low_disk:<mount>`
+/// have no dedup key (`IncidentTracker::is_new_incident` always returns
+/// `true` for them), so *every* firing would write a new file with no
+/// cleanup mechanism: unbounded growth, directly against vigil's own
+/// governing overhead-must-stay-bounded design goal (see AGENTS.md).
+///
+/// This used to gate an automatic diagnosis (the deleted
+/// `is_auto_diagnose_worthy`); it now only gates whether a stub gets
+/// written at all — `vigil investigate` itself has no such restriction and
+/// can investigate anything that does have a stub.
+pub(crate) fn is_journal_worthy(alert_key: &str) -> bool {
+    alert_key == "high_load"
+        || alert_key.starts_with("cpu_hog:")
+        || alert_key == "battery_low"
+        || alert_key.starts_with("high_process_count:")
 }
 
 /// Builds the notification `Alert` for a just-fired incident: the message
@@ -235,6 +262,21 @@ mod tests {
         let a = temp_snapshot_path();
         let b = temp_snapshot_path();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn journal_worthy_for_cpu_and_battery_alerts() {
+        assert!(is_journal_worthy("high_load"));
+        assert!(is_journal_worthy("cpu_hog:1234"));
+        assert!(is_journal_worthy("battery_low"));
+        assert!(is_journal_worthy("high_process_count:node"));
+    }
+
+    #[test]
+    fn not_journal_worthy_for_disk_and_memory_alerts() {
+        assert!(!is_journal_worthy("low_disk:/"));
+        assert!(!is_journal_worthy("low_memory"));
+        assert!(!is_journal_worthy("swap_pressure"));
     }
 
     #[test]

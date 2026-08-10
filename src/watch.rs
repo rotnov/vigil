@@ -79,16 +79,25 @@ pub fn run(args: WatchArgs) {
             for alert in fired {
                 eprintln!("[vigil] ALERT [{}] {}", alert.key, alert.message);
                 if incident_tracker.is_new_incident(alert.target.as_deref(), incident_timeout, now) {
-                    let incidents_dir = std::path::Path::new(&args.incidents_dir);
-                    let stub = crate::incidents::IncidentStub {
-                        alert_key: &alert.key,
-                        alert_title: &alert.title,
-                        alert_message: &alert.message,
-                    };
-                    if let Err(e) = crate::incidents::write_stub(incidents_dir, &stub) {
-                        eprintln!("[vigil] failed to write incident stub: {e}");
+                    if crate::agent::is_journal_worthy(&alert.key) {
+                        let incidents_dir = std::path::Path::new(&args.incidents_dir);
+                        let stub = crate::incidents::IncidentStub {
+                            alert_key: &alert.key,
+                            alert_title: &alert.title,
+                            alert_message: &alert.message,
+                        };
+                        match crate::incidents::write_stub(incidents_dir, &stub) {
+                            Ok(_) => {
+                                crate::alerts::notify(&crate::agent::augment_with_investigate_hint(&alert, watch_log_path.as_deref()));
+                            }
+                            Err(e) => {
+                                eprintln!("[vigil] failed to write incident stub: {e}");
+                                crate::alerts::notify(&alert);
+                            }
+                        }
+                    } else {
+                        crate::alerts::notify(&alert);
                     }
-                    crate::alerts::notify(&crate::agent::augment_with_investigate_hint(&alert, watch_log_path.as_deref()));
                 } else {
                     eprintln!(
                         "[vigil] [{}] continuing open incident for {:?} — notification suppressed",

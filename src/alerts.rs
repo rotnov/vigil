@@ -133,8 +133,8 @@ impl IncidentTracker {
     }
 
     /// Returns true if this firing should be treated as a new incident —
-    /// notify, diagnose, journal — and, either way, records `now` so the
-    /// target's open window keeps extending while it keeps firing.
+    /// notify, journal — and, either way, records `now` so the target's
+    /// open window keeps extending while it keeps firing.
     pub fn is_new_incident(&mut self, target: Option<&str>, timeout: Duration, now: Instant) -> bool {
         let Some(target) = target else { return true };
         let is_new = match self.last_seen.get(target) {

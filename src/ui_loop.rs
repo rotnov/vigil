@@ -68,17 +68,24 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                 for alert in fired {
                     app.push_alert(format!("[{}] {}", alert.key, alert.message));
                     if incident_tracker.is_new_incident(alert.target.as_deref(), incident_timeout, now) {
-                        let incidents_dir = std::path::Path::new(&opts.incidents_dir);
-                        let stub = crate::incidents::IncidentStub {
-                            alert_key: &alert.key,
-                            alert_title: &alert.title,
-                            alert_message: &alert.message,
-                        };
-                        if let Err(e) = crate::incidents::write_stub(incidents_dir, &stub) {
-                            eprintln!("[vigil] failed to write incident stub: {e}");
+                        if crate::agent::is_journal_worthy(&alert.key) {
+                            let incidents_dir = std::path::Path::new(&opts.incidents_dir);
+                            let stub = crate::incidents::IncidentStub {
+                                alert_key: &alert.key,
+                                alert_title: &alert.title,
+                                alert_message: &alert.message,
+                            };
+                            match crate::incidents::write_stub(incidents_dir, &stub) {
+                                // vigil ui's own snapshot loop doesn't write a persistent JSONL log
+                                Ok(_) => crate::alerts::notify(&crate::agent::augment_with_investigate_hint(&alert, None)),
+                                Err(e) => {
+                                    app.push_alert(format!("[vigil] failed to write incident stub: {e}"));
+                                    crate::alerts::notify(&alert);
+                                }
+                            }
+                        } else {
+                            crate::alerts::notify(&alert);
                         }
-                        // vigil ui's own snapshot loop doesn't write a persistent JSONL log
-                        crate::alerts::notify(&crate::agent::augment_with_investigate_hint(&alert, None));
                     }
                 }
                 (sys.global_cpu_usage(), mem_percent(&sys))
