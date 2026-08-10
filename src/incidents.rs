@@ -93,33 +93,6 @@ fn append_section(path: &Path, heading: &str, body: &str) -> Result<(), String> 
     Ok(())
 }
 
-pub struct Incident<'a> {
-    pub alert_key: &'a str,
-    pub alert_title: &'a str,
-    pub alert_message: &'a str,
-    pub diagnosis: &'a str,
-}
-
-/// Write one markdown incident file into `dir` (created if missing).
-/// Returns the path written.
-pub fn record(dir: &Path, incident: &Incident) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("failed to create incidents dir {}: {e}", dir.display()))?;
-
-    let filename = format!("{}-{}.md", timestamp_prefix(), slugify(incident.alert_key));
-    let path = dir.join(filename);
-
-    let body = render_markdown(incident);
-    let mut f = std::fs::File::create(&path).map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-    // Coverage exemption (see AGENTS.md's testing section): triggering a
-    // write failure on an already-successfully-created file needs a fault
-    // (disk full, quota, revoked permissions mid-write) that isn't
-    // reasonably reproducible from a unit test.
-    f.write_all(body.as_bytes())
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-
-    Ok(path)
-}
-
 /// List incident files in `dir`, oldest first (filenames sort chronologically
 /// since they're prefixed `YYYY-MM-DD-HH-MM-SS`). Empty (not an error) if the
 /// directory doesn't exist yet — a fresh install has no incidents.
@@ -138,7 +111,7 @@ pub fn list(dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The first non-empty line of an incident file, stripped of its leading
-/// markdown `#` — i.e. the `alert_title` `record()` wrote as the H1.
+/// markdown `#` — i.e. the `alert_title` `write_stub()` wrote as the H1.
 pub fn extract_title(content: &str) -> &str {
     content
         .lines()
@@ -156,13 +129,6 @@ pub fn extract_rule_message(content: &str) -> Option<&str> {
         .find_map(|l| l.trim().strip_prefix("**Rule message:**"))
         .map(str::trim)
         .filter(|s| !s.is_empty())
-}
-
-fn render_markdown(incident: &Incident) -> String {
-    format!(
-        "# {}\n\n**Alert key:** `{}`\n\n**Rule message:** {}\n\n## Agent diagnosis\n\n{}\n",
-        incident.alert_title, incident.alert_key, incident.alert_message, incident.diagnosis
-    )
 }
 
 /// `alert.key` values can contain `:`/other punctuation (e.g. `cpu_hog:1234`)
@@ -370,83 +336,6 @@ mod tests {
         assert_eq!(ts.chars().nth(7), Some('-'));
         assert_eq!(ts.chars().nth(10), Some(' '));
         assert_eq!(ts.chars().nth(13), Some(':'));
-    }
-
-    #[test]
-    fn record_writes_markdown_with_expected_content_and_filename() {
-        let dir = test_dir();
-        let incident = Incident {
-            alert_key: "high_load",
-            alert_title: "vigil: high load",
-            alert_message: "Load average 12.0 ...",
-            diagnosis: "The culprit is pycharm.",
-        };
-
-        let path = record(&dir, &incident).unwrap();
-        assert!(path.exists());
-        assert!(path.file_name().unwrap().to_string_lossy().ends_with("-high-load.md"));
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("vigil: high load"));
-        assert!(content.contains("`high_load`"));
-        assert!(content.contains("Load average 12.0"));
-        assert!(content.contains("The culprit is pycharm."));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn record_creates_missing_directory() {
-        let dir = test_dir();
-        assert!(!dir.exists());
-        let incident = Incident {
-            alert_key: "battery_low",
-            alert_title: "t",
-            alert_message: "m",
-            diagnosis: "d",
-        };
-        record(&dir, &incident).unwrap();
-        assert!(dir.exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn record_fails_when_the_incidents_dir_cannot_be_created() {
-        let parent = test_dir();
-        std::fs::create_dir_all(&parent).unwrap();
-        let mut perms = std::fs::metadata(&parent).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&parent, perms).unwrap();
-
-        let dir = parent.join("cant-create-this");
-        let incident = Incident { alert_key: "k", alert_title: "t", alert_message: "m", diagnosis: "d" };
-        let result = record(&dir, &incident);
-
-        let mut writable = std::fs::metadata(&parent).unwrap().permissions();
-        writable.set_readonly(false);
-        std::fs::set_permissions(&parent, writable).unwrap();
-        let _ = std::fs::remove_dir_all(&parent);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn record_fails_when_the_file_cannot_be_created() {
-        let dir = test_dir();
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&dir, perms).unwrap();
-
-        let incident = Incident { alert_key: "k", alert_title: "t", alert_message: "m", diagnosis: "d" };
-        let result = record(&dir, &incident);
-
-        let mut writable = std::fs::metadata(&dir).unwrap().permissions();
-        writable.set_readonly(false);
-        std::fs::set_permissions(&dir, writable).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-
-        assert!(result.is_err());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! whatever text comes back. All actual reasoning happens in the Python
 //! process.
 //!
-//! The actual process-spawning/thread-spawning glue lives in
+//! The actual process-spawning glue lives in
 //! `agent_process.rs`, re-exported below — kept in its own file (and
 //! excluded from the coverage gate, see AGENTS.md) because it does real,
 //! costly work (spawns `uv run vigil-agent`, which runs a real Claude Agent
@@ -15,10 +15,10 @@
 
 use std::path::{Path, PathBuf};
 
-pub use crate::agent_process::{ask, maybe_diagnose_alert_async};
+pub use crate::agent_process::ask;
 
 /// Builds the question sent to the agent for an auto-triggered diagnosis.
-/// Pure — kept separate from `maybe_diagnose_alert_async`'s side effects so
+/// Pure — kept separate from `investigate_process::run`'s side effects so
 /// the exact wording (cross-alert context, the watch-log pointer, the
 /// pid-reuse warning) is unit-testable without spawning anything.
 /// `watch_log_path` is `None` when the caller has no persistent JSONL
@@ -60,22 +60,6 @@ pub(crate) fn build_diagnosis_question(
          the likely cause — check beyond the snapshot if useful (e.g. logs, `sample` a hot pid, \
          thermal state) — and suggest what to check or do next."
     )
-}
-
-/// Alert keys worth an automatic agent diagnosis: CPU spikes (by the time
-/// you'd type a question, the spike may already be gone), low battery
-/// (root-causing a drain benefits from the agent actually checking thermal
-/// state / recent high-CPU history rather than a static rule), and unusually
-/// many idle instances of one process (the rule can flag the pattern, but
-/// confirming these are actually leaked/safe to kill — not e.g. a worker
-/// pool doing real, bursty background work — needs the agent to actually go
-/// look, the same way a CPU spike does). Disk and plain memory-pressure
-/// alerts are left to the interactive 'a' flow.
-pub(crate) fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
-    alert_key == "high_load"
-        || alert_key.starts_with("cpu_hog:")
-        || alert_key == "battery_low"
-        || alert_key.starts_with("high_process_count:")
 }
 
 /// Builds the notification `Alert` for a just-fired incident: the message
@@ -122,34 +106,16 @@ pub(crate) fn build_execute_args(plan_json: &str, agent_dir: &str) -> Vec<String
     ]
 }
 
-/// A short, single-paragraph preview of a (possibly multi-paragraph)
-/// diagnosis, for the notification banner — the full text goes to the
-/// incident journal file instead, which is what `message` here points at.
-pub(crate) fn teaser(text: &str, max_len: usize) -> String {
-    // The agent's answers tend to open with a markdown heading (e.g.
-    // "## Diagnosis") — skip those to reach the first real content line.
-    let first_line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .unwrap_or_else(|| text.trim());
-    if first_line.chars().count() <= max_len {
-        first_line.to_string()
-    } else {
-        let truncated: String = first_line.chars().take(max_len).collect();
-        format!("{}…", truncated.trim_end())
-    }
-}
-
 pub(crate) fn temp_snapshot_path() -> PathBuf {
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // Includes a nanosecond timestamp, not just the PID, because background
-    // diagnosis threads (see `maybe_diagnose_alert_async`) can call `ask()`
-    // concurrently within the same process — a PID-only name would race.
+    // Includes a nanosecond timestamp, not just the PID, as a defensive
+    // uniqueness guarantee in case multiple invocations ever overlap — cheap
+    // to keep even though nothing in the current codebase actually calls
+    // `ask()` concurrently within one process.
     p.push(format!("vigil-snapshot-{}-{nanos}.json", std::process::id()));
     p
 }
@@ -256,25 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn teaser_skips_markdown_heading_to_reach_real_content() {
-        let text = "## Diagnosis\n\nSwap is 91% full, pycharm is the top consumer.\n\n## Suggestions\n1. Restart it.";
-        assert_eq!(teaser(text, 200), "Swap is 91% full, pycharm is the top consumer.");
-    }
-
-    #[test]
-    fn teaser_truncates_long_lines_with_ellipsis() {
-        let long = "a".repeat(300);
-        let t = teaser(&long, 50);
-        assert_eq!(t.chars().count(), 51); // 50 chars + ellipsis
-        assert!(t.ends_with('…'));
-    }
-
-    #[test]
-    fn teaser_falls_back_to_whole_text_when_only_headings_present() {
-        assert_eq!(teaser("## Just A Heading", 200), "## Just A Heading");
-    }
-
-    #[test]
     fn temp_snapshot_path_is_unique_per_process() {
         let p = temp_snapshot_path();
         assert!(p.to_string_lossy().contains(&std::process::id().to_string()));
@@ -282,26 +229,12 @@ mod tests {
 
     #[test]
     fn temp_snapshot_path_is_unique_across_concurrent_calls() {
-        // Guards against the race a PID-only filename would have with
-        // `maybe_diagnose_alert_async` spawning concurrent `ask()` calls.
+        // Guards against a PID-only filename colliding if `ask()` is ever
+        // called twice in quick succession within one process (nothing
+        // currently does this, but the guarantee is cheap to keep).
         let a = temp_snapshot_path();
         let b = temp_snapshot_path();
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn auto_diagnose_worthy_for_cpu_and_battery_alerts() {
-        assert!(is_auto_diagnose_worthy("high_load"));
-        assert!(is_auto_diagnose_worthy("cpu_hog:1234"));
-        assert!(is_auto_diagnose_worthy("battery_low"));
-        assert!(is_auto_diagnose_worthy("high_process_count:node"));
-    }
-
-    #[test]
-    fn auto_diagnose_not_worthy_for_disk_and_memory_alerts() {
-        assert!(!is_auto_diagnose_worthy("low_disk:/"));
-        assert!(!is_auto_diagnose_worthy("low_memory"));
-        assert!(!is_auto_diagnose_worthy("swap_pressure"));
     }
 
     #[test]

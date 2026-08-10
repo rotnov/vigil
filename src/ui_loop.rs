@@ -35,7 +35,6 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
     let mut trends = ProcTrends::new();
     let mut app = AppState::new(opts.top_n);
     let mut alert_state = AlertState::new();
-    let mut recent_alerts = crate::alerts::RecentAlerts::new();
     let mut battery_trend = crate::battery::BatteryTrend::new();
     let mut incident_tracker = crate::alerts::IncidentTracker::new();
     // See main.rs's Watch loop for the rationale (2x cooldown).
@@ -53,7 +52,6 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                 let now = Instant::now();
                 last_alert_check = now;
                 let snap = crate::take_snapshot(&mut sys, opts.top_n);
-                let snapshot_json = serde_json::to_string(&snap).unwrap_or_default();
 
                 battery_trend.record(
                     snap.battery.as_ref().and_then(|b| b.charging),
@@ -67,22 +65,20 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
 
                 let mut fired = crate::alerts::evaluate(&snap, cpu_count, &mut alert_state, opts.cooldown, now);
                 fired.extend(crate::alerts::evaluate_battery(&snap, battery_eta, &mut alert_state, opts.cooldown, now));
-                for alert in &fired {
-                    recent_alerts.record(&alert.key, &alert.message, now);
-                }
                 for alert in fired {
                     app.push_alert(format!("[{}] {}", alert.key, alert.message));
                     if incident_tracker.is_new_incident(alert.target.as_deref(), incident_timeout, now) {
-                        crate::alerts::notify(&alert);
-                        let context = recent_alerts.context_excluding(&alert.key, now);
-                        crate::agent::maybe_diagnose_alert_async(
-                            &alert,
-                            &snapshot_json,
-                            &opts.agent_dir,
-                            &opts.incidents_dir,
-                            context.as_deref(),
-                            None, // vigil ui's own snapshot loop doesn't write a persistent JSONL log
-                        );
+                        let incidents_dir = std::path::Path::new(&opts.incidents_dir);
+                        let stub = crate::incidents::IncidentStub {
+                            alert_key: &alert.key,
+                            alert_title: &alert.title,
+                            alert_message: &alert.message,
+                        };
+                        if let Err(e) = crate::incidents::write_stub(incidents_dir, &stub) {
+                            eprintln!("[vigil] failed to write incident stub: {e}");
+                        }
+                        // vigil ui's own snapshot loop doesn't write a persistent JSONL log
+                        crate::alerts::notify(&crate::agent::augment_with_investigate_hint(&alert, None));
                     }
                 }
                 (sys.global_cpu_usage(), mem_percent(&sys))
