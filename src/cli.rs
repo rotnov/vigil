@@ -41,10 +41,7 @@ pub enum Commands {
         /// Minimum seconds between repeat notifications for the same issue
         #[arg(long, default_value_t = 300)]
         cooldown_secs: u64,
-        /// Path to the vigil_agent project directory (for CPU-alert auto-diagnosis)
-        #[arg(long, default_value = "agent")]
-        agent_dir: String,
-        /// Directory for the auto-diagnosis incident journal (markdown, one file per diagnosis)
+        /// Directory for the incident journal (markdown, one stub file per alert-worthy incident)
         #[arg(long, default_value_t = default_incidents_dir())]
         incidents_dir: String,
         /// Health status file, refreshed every tick, that `vigil menubar` polls
@@ -151,18 +148,12 @@ mod tests {
     #[test]
     fn investigate_parses_the_alert_key_positional_argument() {
         let cli = Cli::try_parse_from(["vigil", "investigate", "cpu_hog:37489"]).unwrap();
-        match cli.command {
-            Commands::Investigate { alert_key, .. } => assert_eq!(alert_key, "cpu_hog:37489"),
-            _ => panic!("expected Investigate"),
-        }
+        assert!(matches!(&cli.command, Commands::Investigate { alert_key, .. } if alert_key == "cpu_hog:37489"));
     }
 
     #[test]
     fn fix_parses_the_incident_file_positional_argument() {
         let cli = Cli::try_parse_from(["vigil", "fix", "/tmp/some-incident.md"]).unwrap();
-        match cli.command {
-            Commands::Fix { incident_file, .. } => assert_eq!(incident_file, "/tmp/some-incident.md"),
-            _ => panic!("expected Fix"),
-        }
+        assert!(matches!(&cli.command, Commands::Fix { incident_file, .. } if incident_file == "/tmp/some-incident.md"));
     }
 }

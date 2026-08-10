@@ -40,8 +40,8 @@ fn main() {
             let snap = take_snapshot(&mut sys, top);
             println!("{}", serde_json::to_string(&snap).unwrap());
         }
-        Commands::Watch { interval, count, out, top, no_notify, cooldown_secs, agent_dir, incidents_dir, status_file } => {
-            watch::run(watch::WatchArgs { interval, count, out, top, no_notify, cooldown_secs, agent_dir, incidents_dir, status_file });
+        Commands::Watch { interval, count, out, top, no_notify, cooldown_secs, incidents_dir, status_file } => {
+            watch::run(watch::WatchArgs { interval, count, out, top, no_notify, cooldown_secs, incidents_dir, status_file });
         }
         Commands::Ui { interval, top, no_notify, cooldown_secs, agent_dir, incidents_dir } => {
             let opts = ui::UiOptions {

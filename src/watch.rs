@@ -23,11 +23,6 @@ pub struct WatchArgs {
     pub top: usize,
     pub no_notify: bool,
     pub cooldown_secs: u64,
-    // Retained: the `vigil watch --agent-dir` CLI surface (see cli.rs);
-    // the loop itself no longer spawns the agent now that investigation
-    // is opt-in via `vigil investigate`, so nothing here reads it.
-    #[allow(dead_code)]
-    pub agent_dir: String,
     pub incidents_dir: String,
     pub status_file: String,
 }

@@ -52,13 +52,8 @@ pub fn write_stub(dir: &Path, stub: &IncidentStub) -> Result<PathBuf, String> {
         "# {}\n\n**Alert key:** `{}`\n\n**Rule message:** {}\n",
         stub.alert_title, stub.alert_key, stub.alert_message
     );
-    let mut f = std::fs::File::create(&path).map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-    // Coverage exemption (see AGENTS.md's testing section): triggering a
-    // write failure on an already-successfully-created file needs a fault
-    // (disk full, quota, revoked permissions mid-write) that isn't
-    // reasonably reproducible from a unit test.
-    f.write_all(body.as_bytes())
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    let f = std::fs::File::create(&path).map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+    write_or_err(f, &body, &path)?;
 
     Ok(path)
 }
@@ -80,17 +75,26 @@ pub fn append_fix_execution(path: &Path, journal: &str) -> Result<(), String> {
 }
 
 fn append_section(path: &Path, heading: &str, body: &str) -> Result<(), String> {
-    let mut f = std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .append(true)
         .open(path)
         .map_err(|e| format!("failed to open {} for appending: {e}", path.display()))?;
-    // Coverage exemption (see AGENTS.md's testing section): triggering a
-    // write failure on an already-successfully-opened file needs a fault
-    // (disk full, quota, revoked permissions mid-write) that isn't
-    // reasonably reproducible from a unit test.
-    write!(f, "\n## {heading}\n\n{}\n", body.trim_end())
-        .map_err(|e| format!("failed to append to {}: {e}", path.display()))?;
-    Ok(())
+    let content = format!("\n## {heading}\n\n{}\n", body.trim_end());
+    write_or_err(f, &content, path)
+}
+
+/// Shared by `write_stub` (a freshly `File::create`d file) and
+/// `append_section` (an existing file opened for append) — once a file
+/// handle is in hand, a write failure on either is the same fault (disk
+/// full, quota, revoked permissions mid-write), so it gets one
+/// implementation and one exemption instead of two.
+///
+/// Coverage exemption (see AGENTS.md's testing section): triggering a write
+/// failure on an already-successfully-opened file needs a fault that isn't
+/// reasonably reproducible from a unit test.
+fn write_or_err(mut f: impl Write, content: &str, path: &Path) -> Result<(), String> {
+    f.write_all(content.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 /// List incident files in `dir`, oldest first (filenames sort chronologically
