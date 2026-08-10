@@ -3,8 +3,12 @@ mod agent_process;
 mod alerts;
 mod battery;
 mod cli;
+mod fix_process;
+mod fixplan;
 mod incidents;
 mod incidents_cmd;
+mod investigate;
+mod investigate_process;
 mod menubar;
 mod menubar_loop;
 mod notify;
@@ -36,8 +40,8 @@ fn main() {
             let snap = take_snapshot(&mut sys, top);
             println!("{}", serde_json::to_string(&snap).unwrap());
         }
-        Commands::Watch { interval, count, out, top, no_notify, cooldown_secs, agent_dir, incidents_dir, status_file } => {
-            watch::run(watch::WatchArgs { interval, count, out, top, no_notify, cooldown_secs, agent_dir, incidents_dir, status_file });
+        Commands::Watch { interval, count, out, top, no_notify, cooldown_secs, incidents_dir, status_file } => {
+            watch::run(watch::WatchArgs { interval, count, out, top, no_notify, cooldown_secs, incidents_dir, status_file });
         }
         Commands::Ui { interval, top, no_notify, cooldown_secs, agent_dir, incidents_dir } => {
             let opts = ui::UiOptions {
@@ -52,6 +56,12 @@ fn main() {
         }
         Commands::Incidents { dir, show, limit } => {
             std::process::exit(incidents_cmd::run(&dir, show.as_deref(), limit));
+        }
+        Commands::Investigate { alert_key, agent_dir, incidents_dir, watch_log } => {
+            std::process::exit(investigate_process::run(&alert_key, &agent_dir, &incidents_dir, watch_log.as_deref()));
+        }
+        Commands::Fix { incident_file, agent_dir } => {
+            std::process::exit(fix_process::run(&incident_file, &agent_dir));
         }
         Commands::Menubar { status_file, incidents_dir, poll_secs } => {
             menubar_loop::run(menubar::MenubarOptions { status_file, incidents_dir, poll_interval: Duration::from_secs(poll_secs) });

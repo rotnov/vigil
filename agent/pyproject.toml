@@ -41,4 +41,9 @@ exclude_also = [
     # call. Its only non-trivial logic (`build_prompt`, `format_usage_footer`)
     # is already extracted into separately-tested functions above it.
     "async def ask\\(",
+    # Same reasoning as `ask()` above, for the execute-agent's own query()
+    # call -- `build_categories`/`disallowed_tools_for`/`build_instruction`
+    # are the non-trivial logic, and are separately tested in
+    # test_execute_config.py.
+    "async def execute\\(",
 ]

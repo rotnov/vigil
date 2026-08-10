@@ -7,11 +7,14 @@ snapshot (and, if needed, the live system) and answers questions like "why is it
 "why is disk space low".
 
 The split is deliberate: **Rust never decides or fixes anything** — it only cheaply
-collects metrics (no network, no LLM) and draws them. Diagnosis and recommendations are
-a separate Python process. The agent can *inspect* the live system (logs, `sample`,
-`vm_stat`, `du`, ...) but is blocked at the tool level from modifying it — no Write/Edit,
-no kill/rm/mv/sudo/shutdown. It only ever produces text; nothing on your machine changes
-without you doing it yourself.
+collects metrics (no network, no LLM) and draws them. Diagnosis, fix proposals, and
+fix execution are all a separate Python process. Investigation (`vigil investigate`)
+is read-only, same as always — the agent can *inspect* the live system (logs,
+`sample`, `vm_stat`, `du`, ...) but is blocked at the tool level from modifying it. If
+it identifies a specific, low-risk fix, it may propose one; nothing runs until you
+explicitly approve it step by step with `vigil fix`, which hands only what you
+approved to a separate, narrowly-scoped agent session — see "Investigate, propose,
+approve, execute" below.
 
 ## Features
 
@@ -35,14 +38,14 @@ without you doing it yourself.
   multi-process workload, like a browser with many active tabs, won't match both at
   once) and names concrete `pid (ppid X, age)` samples of the group's oldest members
   in the message — not just a count — so there's something to actually check before
-  deciding whether to kill anything. Auto-triggers an agent investigation, same as
-  `cpu_hog`. See
+  deciding whether to kill anything. Investigate with `vigil investigate
+  high_process_count:<name>`, same as `cpu_hog`. See
   [docs/decisions/0004-leaked-process-detection.md](docs/decisions/0004-leaked-process-detection.md)
 - `vigil ui` — a live terminal dashboard (CPU/MEM sparklines, top processes with a
   ↑/↓/→ trend arrow on memory over the last 10 samples, battery % with a drain-rate
   ETA when discharging). `a` key — ask the agent a free-form question. `w` key —
   ask, pre-filled, why the current #1 CPU process is using what it's using
-- `vigil incidents` — list or show saved auto-diagnoses from the terminal, without
+- `vigil incidents` — list or show saved investigations from the terminal, without
   needing an already-open `ui` session (a TUI can't pop itself open on a push
   notification): `vigil incidents` lists recent ones, `vigil incidents --show <name>`
   prints one in full (accepts a filename or any substring that matches exactly one)
@@ -53,29 +56,64 @@ without you doing it yourself.
   sampling on its own — see
   [docs/decisions/0002-menu-bar-health-indicator.md](docs/decisions/0002-menu-bar-health-indicator.md)
 
-Every agent answer — interactive `a` or auto-triggered — ends with a token/cost
-footer (`_Tokens: N in / M out (+K cache read) — ~$X_`), since the agent's own
-token spend is part of the overhead this project tries to keep visible, not hide.
+Every agent answer — interactive `a`, `vigil investigate`, or `vigil fix` — ends with
+a token/cost footer (`_Tokens: N in / M out (+K cache read) — ~$X_`), since the
+agent's own token spend is part of the overhead this project tries to keep visible,
+not hide.
 
-When `high_load`, `cpu_hog`, or `battery_low` fires, vigil also asks the agent to
-investigate in a background thread — non-blocking, a follow-up notification with the
-answer once it's done, and the diagnosis is saved as a markdown file in
-`~/.vigil/incidents/<date>-<time>-<slug>.md` (override with `--incidents-dir`). Disk
-and plain memory-pressure alerts don't auto-trigger the agent, and the interactive `a`
-flow is UI-only — neither writes to the incident journal.
+### Investigate, propose, approve, execute
 
-Because that investigation runs seconds to minutes after the alert fired, the flagged
-process's pid can already have been recycled by the OS to something unrelated by the
-time the agent checks it — observed live (see
-`2026-08-07-14-20-56-cpu-hog-27339.md`): an alert named "claude" whose pid had already
-become an unrelated `bfs` scan. Process-targeted alerts (`high_load`/`swap_pressure`/
-`low_memory`/`cpu_hog`/`battery_low`) capture the process's full command line
-synchronously, at the moment they fire, and hand it to the agent alongside the alert
-so a stale-by-the-time-you-check pid doesn't get misattributed.
+Nothing runs automatically when an alert fires. For `high_load`, `cpu_hog:*`,
+`battery_low`, and `high_process_count:*`, vigil writes a stub incident file
+(title, alert key, rule message, and — for process-specific alerts that captured
+one — a `**Command:**` line with the process's command line at fire time) to
+`~/.vigil/incidents/<date>-<time>-<slug>.md` (override with `--incidents-dir`) and
+notifies with the command to investigate it. Other alert keys (low disk, connection
+counts, swap/memory pressure) just fire a plain notification, same as before this
+feature — no stub file, no investigate hint, nothing added to the journal:
+
+```bash
+# after a notification like "cpu_hog:37489 — investigate? vigil investigate cpu_hog:37489"
+./target/release/vigil investigate cpu_hog:37489
+```
+
+This runs the same read-only agent as the interactive `a` flow and appends its
+answer to the incident file. If it's confident about a specific, narrow, low-risk
+fix, it also appends a `## Proposed fix` JSON plan — most diagnoses won't have one.
+When there is one:
+
+```bash
+./target/release/vigil fix ~/.vigil/incidents/2026-08-09-01-09-41-cpu-hog-37489.md
+```
+
+prompts per step (`[1/2] kill_process — Kill the stale claude session ... Approve?
+[y/N]`), then hands *only* the steps you approved to a separate, narrowly-scoped
+agent session (`agent/src/vigil_agent/execute.py`) — its tool config is built fresh
+each time from exactly the fix categories your approved steps belong to
+(`kill_process`, `delete_path`, `system_setting`), with a non-liftable hard floor
+(`sudo`/`dd`/`diskutil erase`-family/`shutdown`/`chmod`/`chown`/etc.) that stays
+blocked no matter what's approved. The execute-agent re-verifies each step's target
+before acting — a pid/path captured when the plan was proposed can be stale by
+execution time — and aborts all remaining steps the moment one fails or diverges,
+rather than pressing on with stale assumptions. Results append to the same incident
+file as a `## Fix execution` section. See
+[docs/decisions/0006-opt-in-investigate-propose-approve-execute.md](docs/decisions/0006-opt-in-investigate-propose-approve-execute.md)
+for the full design rationale.
+
+Because you may not run `vigil investigate` until well after the alert fired —
+seconds later, or much longer — the flagged process's pid can already have been
+recycled by the OS to something unrelated by the time you check it: observed live
+(see `2026-08-07-14-20-56-cpu-hog-27339.md`), an alert named "claude" whose pid had
+already become an unrelated `bfs` scan. Process-targeted alerts (`high_load`/
+`cpu_hog`/`battery_low`) capture the flagged process's full command line
+synchronously, at the moment they fire, and hand it to the agent when you later run
+`vigil investigate` — a guard against exactly that. Still worth double-checking
+yourself (`ps -p <pid> -o command`) as a sanity check, especially the longer you wait
+to investigate.
 
 Repeat firings are treated as one ongoing incident, not a fresh one each time:
-`alerts::IncidentTracker` skips the notification, the diagnosis, and the journal
-entry for a target that already has one open (still firing within twice the alert
+`alerts::IncidentTracker` skips the notification and the incident stub for a target
+that already has one open (still firing within twice the alert
 cooldown of its last firing), and only starts a new incident once that target has
 been quiet for longer than that. For `cpu_hog`/`high_process_count`, the alert is
 fundamentally about one specific process/group, so "target" means exactly that — a
@@ -105,8 +143,9 @@ ports and the remote peer isn't loopback; see
 [docs/decisions/0001-network-connection-monitoring.md](docs/decisions/0001-network-connection-monitoring.md)
 for why, and for how the (first-guess, expect-to-tune) thresholds were picked.
 
-Notifications and the agent **only suggest** — they never kill, delete, or modify
-anything on their own.
+Nothing on your machine changes unless you approve it: alerts and `vigil investigate`
+only ever produce text, and the one path that can act, `vigil fix`, runs only the
+steps you approved, one at a time.
 
 ## Install
 
@@ -130,9 +169,13 @@ Requires an installed and logged-in [Claude Code](https://claude.com/claude-code
 # live dashboard, ask the agent a question with 'a'
 ./target/release/vigil ui
 
-# browse past auto-diagnoses from a plain shell
+# browse past investigations from a plain shell
 ./target/release/vigil incidents
 ./target/release/vigil incidents --show cpu-hog-64955
+
+# investigate an alert the notification pointed at, then act on any proposed fix
+./target/release/vigil investigate cpu_hog:37489
+./target/release/vigil fix ~/.vigil/incidents/2026-08-09-01-09-41-cpu-hog-37489.md
 
 # menu bar health indicator (run alongside `vigil watch`, not instead of it)
 ./target/release/vigil menubar
@@ -141,7 +184,7 @@ Requires an installed and logged-in [Claude Code](https://claude.com/claude-code
 ## Tests
 
 ```bash
-cargo llvm-cov --workspace --ignore-filename-regex 'src/(main|watch|ui_loop|menubar_loop|agent_process|notify)\.rs' \
+cargo llvm-cov --workspace --ignore-filename-regex 'src/(main|watch|ui_loop|menubar_loop|agent_process|notify|investigate_process|fix_process)\.rs' \
   --fail-under-lines 99.5 --fail-under-regions 98
 cd agent && uv run pytest       # prompt building, the tool-access safety rails, cov-fail-under=99.9
 ```
@@ -149,9 +192,9 @@ cd agent && uv run pytest       # prompt building, the tool-access safety rails,
 The TUI isn't tested by hand — `ratatui::backend::TestBackend` renders frames into a
 buffer, and tests assert on the buffer's content without a real terminal. See
 `AGENTS.md`'s testing section for why line coverage is measured with that
-`--ignore-filename-regex` (six files are genuine OS-boundary glue — a real terminal
-event loop, a real macOS menu bar event loop, a real process spawn — with everything
-else around them fully unit-tested) and
+`--ignore-filename-regex` (eight files are genuine OS-boundary glue — a real terminal
+event loop, a real macOS menu bar event loop, three real process spawns — with
+everything else around them fully unit-tested) and
 [docs/decisions/0003-coverage-gate-glue-isolation.md](docs/decisions/0003-coverage-gate-glue-isolation.md)
 for the design rationale.
 
@@ -182,17 +225,21 @@ the real `--release` build anything ships as.
 ```
 vigil (Rust)                            agent/ (Python, Claude Agent SDK)
 ├── cli.rs — clap arg definitions       ├── prompts.py    — pure prompt building (tested without network)
-├── snapshot.rs — snapshot collection,  ├── diagnose.py   — query() to Claude: Bash/Read/Grep/Glob allowed,
+├── snapshot.rs — snapshot collection,  ├── diagnose.py   — investigation query(): Bash/Read/Grep/Glob allowed,
 │   incl. connections via `netstat`     │                    Write/Edit + destructive Bash patterns denylisted
-│   (see docs/decisions/0001)           └── cli.py        — vigil-agent ask --snapshot F --question Q
-├── alerts.rs — threshold rules
-│   (no LLM, no network)
-├── battery.rs — drain-rate ETA
+│   (see docs/decisions/0001)           ├── execute.py    — fix-execution query(): per-plan-scoped Bash unlocks
+├── alerts.rs — threshold rules         │                    on top of a non-liftable hard floor
+│   (no LLM, no network)                └── cli.py        — vigil-agent ask --snapshot F --question Q
+├── battery.rs — drain-rate ETA                              vigil-agent execute --plan-json J
 │   (no powermetrics/sudo)
-├── incidents.rs — markdown journal
-│   for auto-diagnoses only
-│   (~/.vigil/incidents/)
+├── incidents.rs — markdown journal:
+│   write_stub / append_diagnosis /
+│   append_fix_execution (~/.vigil/incidents/)
 ├── incidents_cmd.rs — `vigil incidents`
+├── fixplan.rs — proposed-fix JSON plan
+│   parsing + approval formatting
+├── investigate.rs — resolve an alert
+│   key to its incident file
 ├── agent.rs — question/arg building,
 │   output parsing (pure, unit-tested)
 ├── menubar.rs — health classification,
@@ -205,6 +252,10 @@ vigil (Rust)                            agent/ (Python, Claude Agent SDK)
 │   tray/menu event loop (OS-boundary)
 ├── agent_process.rs — the actual
 │   `uv run vigil-agent` spawn (OS-boundary)
+├── investigate_process.rs — `vigil
+│   investigate`'s spawn (OS-boundary)
+├── fix_process.rs — `vigil fix`'s
+│   approval prompt + spawn (OS-boundary)
 ├── notify.rs — the actual `osascript`
 │   shell-out (OS-boundary)
 └── main.rs — Cli::parse() + dispatch

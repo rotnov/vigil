@@ -6,6 +6,9 @@ status: accepted
 
 ## 0004: Leaked process detection
 
+Note: `agent::is_auto_diagnose_worthy`, referenced below, was later replaced by
+`agent::is_journal_worthy` — see ADR 0006.
+
 - Status: accepted
 - Context: a live investigation (2026-08-07) found 224 `node` processes on the
   maintainer's machine sitting at 0.0% combined CPU — turned out to be MCP server

@@ -1,16 +1,16 @@
 //! `vigil watch` — the continuous sampling loop: writes JSONL, evaluates
-//! alert rules, fires notifications, and (for the incident-worthy rules)
-//! triggers a background agent diagnosis.
+//! alert rules, fires notifications, and writes an incident stub for each
+//! new incident.
 //!
 //! Excluded from the coverage gate (see AGENTS.md's testing section and the
 //! `--ignore-filename-regex` in the test command): this is genuinely an
 //! infinite loop with real `Command`/file/notification side effects on
 //! every iteration, only exitable by `count` reaching a nonzero target or
 //! the process being killed. Every piece of *logic* inside it — alert
-//! evaluation, incident tracking, the diagnosis question, notification
-//! formatting — is already unit-tested where it's actually defined
-//! (`alerts.rs`, `agent.rs`, `battery.rs`); this loop is just the thin glue
-//! that calls them on a timer.
+//! evaluation, incident tracking, notification formatting — is already
+//! unit-tested where it's actually defined (`alerts.rs`, `agent.rs`,
+//! `battery.rs`); this loop is just the thin glue that calls them on a
+//! timer.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -23,7 +23,6 @@ pub struct WatchArgs {
     pub top: usize,
     pub no_notify: bool,
     pub cooldown_secs: u64,
-    pub agent_dir: String,
     pub incidents_dir: String,
     pub status_file: String,
 }
@@ -42,7 +41,6 @@ pub fn run(args: WatchArgs) {
     let cpu_count = sys.cpus().len();
     let mut alert_state = crate::alerts::AlertState::new();
     let mut battery_trend = crate::battery::BatteryTrend::new();
-    let mut recent_alerts = crate::alerts::RecentAlerts::new();
     let mut incident_tracker = crate::alerts::IncidentTracker::new();
     let cooldown = Duration::from_secs(args.cooldown_secs);
     // Wide enough that a rule cycling in and out right at its own
@@ -78,25 +76,32 @@ pub fn run(args: WatchArgs) {
         if !args.no_notify {
             let mut fired = crate::alerts::evaluate(&snap, cpu_count, &mut alert_state, cooldown, now);
             fired.extend(crate::alerts::evaluate_battery(&snap, battery_eta, &mut alert_state, cooldown, now));
-            for alert in &fired {
-                recent_alerts.record(&alert.key, &alert.message, now);
-            }
             for alert in fired {
                 eprintln!("[vigil] ALERT [{}] {}", alert.key, alert.message);
                 if incident_tracker.is_new_incident(alert.target.as_deref(), incident_timeout, now) {
-                    crate::alerts::notify(&alert);
-                    let context = recent_alerts.context_excluding(&alert.key, now);
-                    crate::agent::maybe_diagnose_alert_async(
-                        &alert,
-                        &line,
-                        &args.agent_dir,
-                        &args.incidents_dir,
-                        context.as_deref(),
-                        watch_log_path.as_deref(),
-                    );
+                    if crate::agent::is_journal_worthy(&alert.key) {
+                        let incidents_dir = std::path::Path::new(&args.incidents_dir);
+                        let stub = crate::incidents::IncidentStub {
+                            alert_key: &alert.key,
+                            alert_title: &alert.title,
+                            alert_message: &alert.message,
+                            command: alert.command.as_deref(),
+                        };
+                        match crate::incidents::write_stub(incidents_dir, &stub) {
+                            Ok(_) => {
+                                crate::alerts::notify(&crate::agent::augment_with_investigate_hint(&alert, watch_log_path.as_deref()));
+                            }
+                            Err(e) => {
+                                eprintln!("[vigil] failed to write incident stub: {e}");
+                                crate::alerts::notify(&alert);
+                            }
+                        }
+                    } else {
+                        crate::alerts::notify(&alert);
+                    }
                 } else {
                     eprintln!(
-                        "[vigil] [{}] continuing open incident for {:?} — notification/diagnosis suppressed",
+                        "[vigil] [{}] continuing open incident for {:?} — notification suppressed",
                         alert.key, alert.target
                     );
                 }

@@ -1,6 +1,8 @@
-//! `vigil incidents` — lists or shows saved auto-diagnosis reports so the
-//! journal can be checked from a plain shell, without an already-open TUI
-//! session (a TUI can't pop itself open on a push notification).
+//! `vigil incidents` — lists or shows saved incident stubs (and, when
+//! `vigil investigate`/`vigil fix` have since run against them, their
+//! appended diagnosis/fix sections) so the journal can be checked from a
+//! plain shell, without an already-open TUI session (a TUI can't pop itself
+//! open on a push notification).
 //!
 //! Returns an exit code instead of calling `std::process::exit` directly —
 //! that keeps every branch (including the error paths) callable from a unit

@@ -8,6 +8,7 @@ import json
 import sys
 
 from .diagnose import ask
+from .execute import execute
 
 
 def main() -> None:
@@ -17,6 +18,9 @@ def main() -> None:
     ask_parser = sub.add_parser("ask", help="Diagnose a snapshot and answer a question about it")
     ask_parser.add_argument("--snapshot", required=True, help="Path to a vigil snapshot JSON file")
     ask_parser.add_argument("--question", default=None, help="Question about the snapshot (optional)")
+
+    execute_parser = sub.add_parser("execute", help="Execute an approved fix plan")
+    execute_parser.add_argument("--plan-json", required=True, help="JSON array of approved plan steps")
 
     args = parser.parse_args()
 
@@ -29,6 +33,16 @@ def main() -> None:
             sys.exit(1)
 
         answer = asyncio.run(ask(snapshot, args.question))
+        print(answer)
+
+    elif args.command == "execute":
+        try:
+            plan = json.loads(args.plan_json)
+        except json.JSONDecodeError as e:
+            print(f"failed to parse --plan-json: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        answer = asyncio.run(execute(plan))
         print(answer)
 
 

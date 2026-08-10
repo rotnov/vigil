@@ -6,7 +6,7 @@
 //! separate, explicit user confirmation outside this tool.
 
 use crate::{ProcGroup, ProcInfo, Snapshot};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const SWAP_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
@@ -18,8 +18,6 @@ const CPU_HOG_STREAK_REQUIRED: u32 = 3;
 const HIGH_LOAD_SUSTAINED_DURATION: Duration = Duration::from_secs(30);
 const LOW_DISK_AVAILABLE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 const LOW_BATTERY_PCT: u8 = 20;
-const RECENT_ALERTS_WINDOW: Duration = Duration::from_secs(5 * 60);
-const RECENT_ALERTS_CAPACITY: usize = 10;
 /// First-guess thresholds (see docs/decisions/0001-network-connection-monitoring.md)
 /// — not derived from a fleet baseline, just picked generously above what a
 /// single busy dev workstation showed in practice (~570 total connections
@@ -71,45 +69,6 @@ fn self_process_note(name: &str) -> &'static str {
     }
 }
 
-/// A short rolling log of every alert that fired recently (any key,
-/// including ones that never trigger an agent diagnosis on their own —
-/// e.g. `low_memory`/`swap_pressure`). Fed to the agent as extra context
-/// alongside whichever alert *did* trigger it, so a `cpu_hog` diagnosis
-/// doesn't have to independently rediscover a memory-pressure problem
-/// that another rule already flagged in the same window.
-pub struct RecentAlerts {
-    entries: VecDeque<(Instant, String, String)>,
-}
-
-impl RecentAlerts {
-    pub fn new() -> Self {
-        Self { entries: VecDeque::with_capacity(RECENT_ALERTS_CAPACITY) }
-    }
-
-    pub fn record(&mut self, key: &str, message: &str, now: Instant) {
-        if self.entries.len() == RECENT_ALERTS_CAPACITY {
-            self.entries.pop_front();
-        }
-        self.entries.push_back((now, key.to_string(), message.to_string()));
-    }
-
-    /// Messages of other alerts (any key) fired within the recency window,
-    /// excluding `exclude_key` itself. `None` if there's nothing else.
-    pub fn context_excluding(&self, exclude_key: &str, now: Instant) -> Option<String> {
-        let others: Vec<&str> = self
-            .entries
-            .iter()
-            .filter(|(t, k, _)| k != exclude_key && now.duration_since(*t) <= RECENT_ALERTS_WINDOW)
-            .map(|(_, _, m)| m.as_str())
-            .collect();
-        if others.is_empty() {
-            None
-        } else {
-            Some(others.join(" | "))
-        }
-    }
-}
-
 pub struct Alert {
     pub key: String,
     pub title: String,
@@ -134,11 +93,10 @@ pub struct Alert {
     /// consumer for whoever reads it.
     pub target: Option<String>,
     /// The full command line of `target`, captured from the same `ProcInfo`
-    /// at the moment this alert fired — not re-looked-up later. A
-    /// background diagnosis (see `agent_process::maybe_diagnose_alert_async`)
-    /// runs seconds to minutes after firing, and by then the OS may have
-    /// recycled `target`'s pid to an unrelated process (observed live: an
-    /// alert named "claude" whose pid had already become a `bfs` scan by
+    /// at the moment this alert fired — not re-looked-up later. A `vigil
+    /// investigate` run may happen seconds to minutes after firing, and by
+    /// then the OS may have recycled `target`'s pid to an unrelated process
+    /// (observed live: an alert named "claude" whose pid had already become a `bfs` scan by
     /// the time the agent checked `ps -p <pid>`, see incident
     /// 2026-08-07-14-20-56-cpu-hog-27339.md). Capturing the command here,
     /// synchronously, at fire time avoids that race.
@@ -147,22 +105,24 @@ pub struct Alert {
 
 /// Tracks whether an alert firing for a given target process is the start
 /// of a new incident or a continuation of one still open, so a process
-/// pegged at high CPU for an hour produces one notification, one
-/// background diagnosis, and one journal entry — not a fresh one on every
-/// re-fire of the underlying rule (which, per-rule, only needs its own
-/// `cooldown` to elapse to fire again). An incident is "still open" as
-/// long as its target keeps firing within `timeout` of its last firing;
-/// once a target goes quiet for `timeout`, the next firing starts a new
-/// incident. Targetless alerts (`target: None` — e.g. `low_disk:<mount>`,
-/// `high_connection_count`) have nothing to key on and are always "new".
+/// pegged at high CPU for an hour produces one notification and one
+/// incident stub — not a fresh one on every re-fire of the underlying rule
+/// (which, per-rule, only needs its own `cooldown` to elapse to fire
+/// again). An incident is "still open" as long as its target keeps firing
+/// within `timeout` of its last firing; once a target goes quiet for
+/// `timeout`, the next firing starts a new incident. Targetless alerts
+/// (`target: None` — e.g. `low_disk:<mount>`, `high_connection_count`)
+/// have nothing to key on and are always "new".
 ///
 /// Replaces an earlier, narrower `agent::DiagnosisCoalescer` that only
 /// deduped near-simultaneous (120s) diagnoses. Real repeats of the same
 /// incident in the field arrived 5-13 minutes apart — gated by each rule's
 /// own re-fire cooldown, not by anything a 120s window could ever catch —
 /// so that mechanism never actually engaged. This subsumes it and also
-/// covers the native notification and the journal write, not just the
-/// diagnosis, since all three were spamming for the same reason.
+/// covers the native notification and the incident stub write together,
+/// not just one of them, since both were spamming for the same reason.
+/// (Investigation itself is opt-in now, via `vigil investigate` — this
+/// tracker has no opinion on when or whether that happens.)
 pub struct IncidentTracker {
     last_seen: HashMap<String, Instant>,
 }
@@ -173,8 +133,8 @@ impl IncidentTracker {
     }
 
     /// Returns true if this firing should be treated as a new incident —
-    /// notify, diagnose, journal — and, either way, records `now` so the
-    /// target's open window keeps extending while it keeps firing.
+    /// notify, journal — and, either way, records `now` so the target's
+    /// open window keeps extending while it keeps firing.
     pub fn is_new_incident(&mut self, target: Option<&str>, timeout: Duration, now: Instant) -> bool {
         let Some(target) = target else { return true };
         let is_new = match self.last_seen.get(target) {
@@ -1026,10 +986,10 @@ mod tests {
 
     #[test]
     fn cpu_hog_captures_the_process_command_line_at_fire_time() {
-        // Guards against pid-reuse misattribution in the async diagnosis
-        // (see Alert::command's doc comment and the live incident that
-        // motivated it) -- the command must be captured here, synchronously,
-        // not looked up again later by pid.
+        // Guards against pid-reuse misattribution in a later `vigil
+        // investigate` run (see Alert::command's doc comment and the live
+        // incident that motivated it) -- the command must be captured here,
+        // synchronously, not looked up again later by pid.
         let mut snap = healthy_snapshot();
         snap.top_cpu = vec![ProcInfo {
             pid: 99,
@@ -1174,51 +1134,6 @@ mod tests {
 
         assert!(evaluate_battery(&snap, None, &mut state, cooldown, now).is_some());
         assert!(evaluate_battery(&snap, None, &mut state, cooldown, now).is_none());
-    }
-
-    #[test]
-    fn recent_alerts_context_excludes_self_and_includes_others() {
-        let mut recent = RecentAlerts::new();
-        let now = Instant::now();
-        recent.record("swap_pressure", "Swap usage 13.7 GB", now);
-        recent.record("low_memory", "Only 3.1% memory free", now);
-        recent.record("cpu_hog:37489", "pycharm has held 111% CPU", now);
-
-        let ctx = recent.context_excluding("cpu_hog:37489", now).unwrap();
-        assert!(ctx.contains("Swap usage 13.7 GB"));
-        assert!(ctx.contains("Only 3.1% memory free"));
-        assert!(!ctx.contains("111% CPU"), "must not include the alert's own message");
-    }
-
-    #[test]
-    fn recent_alerts_context_is_none_when_nothing_else_fired() {
-        let mut recent = RecentAlerts::new();
-        let now = Instant::now();
-        recent.record("cpu_hog:1", "only this one", now);
-        assert!(recent.context_excluding("cpu_hog:1", now).is_none());
-        assert!(recent.context_excluding("cpu_hog:2", now).unwrap().contains("only this one"));
-    }
-
-    #[test]
-    fn recent_alerts_context_drops_entries_outside_the_window() {
-        let mut recent = RecentAlerts::new();
-        let now = Instant::now();
-        recent.record("swap_pressure", "stale", now - RECENT_ALERTS_WINDOW - Duration::from_secs(1));
-        recent.record("cpu_hog:1", "current", now);
-
-        assert!(recent.context_excluding("cpu_hog:1", now).is_none(), "the swap_pressure entry is too old to count");
-    }
-
-    #[test]
-    fn recent_alerts_caps_capacity_dropping_oldest_first() {
-        let mut recent = RecentAlerts::new();
-        let now = Instant::now();
-        for i in 0..(RECENT_ALERTS_CAPACITY + 3) {
-            recent.record(&format!("key{i}"), &format!("msg{i}"), now);
-        }
-        let ctx = recent.context_excluding("nonexistent", now).unwrap();
-        assert!(!ctx.contains("msg0"), "oldest entries should have been evicted");
-        assert!(ctx.contains(&format!("msg{}", RECENT_ALERTS_CAPACITY + 2)), "most recent entry must survive");
     }
 
     #[test]

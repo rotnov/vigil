@@ -1,4 +1,4 @@
-from vigil_agent.prompts import SYSTEM_PROMPT, build_prompt
+from vigil_agent.prompts import EXECUTE_SYSTEM_PROMPT, SYSTEM_PROMPT, build_prompt
 
 
 def test_build_prompt_embeds_snapshot_and_question():
@@ -41,3 +41,17 @@ def test_system_prompt_forbids_modifying_the_system_despite_shell_access():
     assert "inspect the system, never change it" in lowered
     assert "kill" in lowered
     assert "sudo" in lowered
+
+
+def test_system_prompt_documents_the_proposed_fix_json_schema():
+    assert "## Proposed fix" in SYSTEM_PROMPT
+    for category in ("kill_process", "delete_path", "system_setting"):
+        assert category in SYSTEM_PROMPT
+    assert '"plan"' in SYSTEM_PROMPT
+
+
+def test_execute_system_prompt_requires_reverification_and_abort_on_failure():
+    lowered = EXECUTE_SYSTEM_PROMPT.lower()
+    assert "re-verify" in lowered
+    assert "stop" in lowered
+    assert "target_hint" in EXECUTE_SYSTEM_PROMPT

@@ -5,7 +5,7 @@
 //! whatever text comes back. All actual reasoning happens in the Python
 //! process.
 //!
-//! The actual process-spawning/thread-spawning glue lives in
+//! The actual process-spawning glue lives in
 //! `agent_process.rs`, re-exported below — kept in its own file (and
 //! excluded from the coverage gate, see AGENTS.md) because it does real,
 //! costly work (spawns `uv run vigil-agent`, which runs a real Claude Agent
@@ -15,28 +15,24 @@
 
 use std::path::{Path, PathBuf};
 
-pub use crate::agent_process::{ask, maybe_diagnose_alert_async};
+pub use crate::agent_process::ask;
 
-/// Builds the question sent to the agent for an auto-triggered diagnosis.
-/// Pure — kept separate from `maybe_diagnose_alert_async`'s side effects so
-/// the exact wording (cross-alert context, the watch-log pointer, the
-/// pid-reuse warning) is unit-testable without spawning anything.
+/// Builds the question `vigil investigate` sends to the agent.
+/// Pure — kept separate from `investigate_process::run`'s side effects so
+/// the exact wording (the watch-log pointer, the pid-reuse warning) is
+/// unit-testable without spawning anything.
 /// `watch_log_path` is `None` when the caller has no persistent JSONL
 /// history to point at (e.g. `vigil ui`'s own snapshot loop doesn't write
 /// one — only `vigil watch` does). `command` is `Alert::command` — the
 /// target process's full command line, captured synchronously at the
-/// moment the alert fired (see that field's doc comment for why: this
-/// diagnosis runs seconds to minutes later, in the background, and by then
+/// moment the alert fired (see that field's doc comment for why: a `vigil
+/// investigate` run may happen seconds to minutes after firing, and by then
 /// the OS may have recycled the pid to a completely different process).
 pub(crate) fn build_diagnosis_question(
     alert_message: &str,
-    recent_context: Option<&str>,
     watch_log_path: Option<&str>,
     command: Option<&str>,
 ) -> String {
-    let context_note = recent_context
-        .map(|c| format!(" Other rules that also fired recently (possibly the same root cause): {c}."))
-        .unwrap_or_default();
     let history_note = match watch_log_path {
         Some(path) => format!(
             " Don't just describe this one snapshot — check recent history in {path} (JSON Lines, \
@@ -56,45 +52,81 @@ pub(crate) fn build_diagnosis_question(
         None => String::new(),
     };
     format!(
-        "A monitoring rule just fired: \"{alert_message}\".{context_note}{history_note}{command_note} Investigate \
+        "A monitoring rule just fired: \"{alert_message}\".{history_note}{command_note} Investigate \
          the likely cause — check beyond the snapshot if useful (e.g. logs, `sample` a hot pid, \
          thermal state) — and suggest what to check or do next."
     )
 }
 
-/// Alert keys worth an automatic agent diagnosis: CPU spikes (by the time
-/// you'd type a question, the spike may already be gone), low battery
-/// (root-causing a drain benefits from the agent actually checking thermal
-/// state / recent high-CPU history rather than a static rule), and unusually
-/// many idle instances of one process (the rule can flag the pattern, but
-/// confirming these are actually leaked/safe to kill — not e.g. a worker
-/// pool doing real, bursty background work — needs the agent to actually go
-/// look, the same way a CPU spike does). Disk and plain memory-pressure
-/// alerts are left to the interactive 'a' flow.
-pub(crate) fn is_auto_diagnose_worthy(alert_key: &str) -> bool {
+/// Alert keys worth writing a permanent incident-journal stub for (see
+/// `incidents::write_stub`): CPU spikes (by the time you'd type a question,
+/// the spike may already be gone), low battery (root-causing a drain
+/// benefits from a written record plus a later `vigil investigate` run
+/// actually checking thermal state / recent high-CPU history), and
+/// unusually many idle instances of one process (confirming these are
+/// actually leaked/safe to kill — not e.g. a worker pool doing real, bursty
+/// background work — is worth a permanent record, the same way a CPU spike
+/// is). Disk, connection-count, and plain memory-pressure alerts still get
+/// a plain notification (`alerts::notify`, no journal entry) — this gate
+/// exists because, without it, targetless alerts like `low_disk:<mount>`
+/// have no dedup key (`IncidentTracker::is_new_incident` always returns
+/// `true` for them), so *every* firing would write a new file with no
+/// cleanup mechanism: unbounded growth, directly against vigil's own
+/// governing overhead-must-stay-bounded design goal (see AGENTS.md).
+///
+/// This used to gate an automatic diagnosis (the deleted
+/// `is_auto_diagnose_worthy`); it now only gates whether a stub gets
+/// written at all — `vigil investigate` itself has no such restriction and
+/// can investigate anything that does have a stub.
+pub(crate) fn is_journal_worthy(alert_key: &str) -> bool {
     alert_key == "high_load"
         || alert_key.starts_with("cpu_hog:")
         || alert_key == "battery_low"
         || alert_key.starts_with("high_process_count:")
 }
 
-/// A short, single-paragraph preview of a (possibly multi-paragraph)
-/// diagnosis, for the notification banner — the full text goes to the
-/// incident journal file instead, which is what `message` here points at.
-pub(crate) fn teaser(text: &str, max_len: usize) -> String {
-    // The agent's answers tend to open with a markdown heading (e.g.
-    // "## Diagnosis") — skip those to reach the first real content line.
-    let first_line = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#'))
-        .unwrap_or_else(|| text.trim());
-    if first_line.chars().count() <= max_len {
-        first_line.to_string()
-    } else {
-        let truncated: String = first_line.chars().take(max_len).collect();
-        format!("{}…", truncated.trim_end())
+/// Builds the notification `Alert` for a just-fired incident: the message
+/// now points at the explicit opt-in investigate command instead of
+/// promising a diagnosis that no longer happens automatically. `watch_log`
+/// is included in the hinted command when the caller has one (`vigil
+/// watch` does; `vigil ui`'s own snapshot loop doesn't — see its call
+/// site) so the eventual `vigil investigate` run can still check trend
+/// history, not just the one snapshot at alert-fire time. Pure —
+/// everything else about `alert` is carried through unchanged.
+pub(crate) fn augment_with_investigate_hint(
+    alert: &crate::alerts::Alert,
+    watch_log_path: Option<&str>,
+) -> crate::alerts::Alert {
+    let hint = match watch_log_path {
+        Some(p) => format!("`vigil investigate {} --watch-log {p}`", alert.key),
+        None => format!("`vigil investigate {}`", alert.key),
+    };
+    crate::alerts::Alert {
+        key: alert.key.clone(),
+        title: alert.title.clone(),
+        message: format!("{} — investigate? {hint}", alert.message),
+        target: alert.target.clone(),
+        command: alert.command.clone(),
     }
+}
+
+/// Pure argv construction for `vigil-agent execute`, the execute-agent
+/// invocation `fix_process::run` spawns after the user approves a plan —
+/// mirrors `build_args`'s split from the actual `Command` spawn.
+/// `plan_json` is the JSON array of *already-approved* steps only (see
+/// `fixplan::approved_steps_json`) — the execute-agent never receives the
+/// rejected ones.
+pub(crate) fn build_execute_args(plan_json: &str, agent_dir: &str) -> Vec<String> {
+    vec![
+        "uv".to_string(),
+        "run".to_string(),
+        "--project".to_string(),
+        agent_dir.to_string(),
+        "vigil-agent".to_string(),
+        "execute".to_string(),
+        "--plan-json".to_string(),
+        plan_json.to_string(),
+    ]
 }
 
 pub(crate) fn temp_snapshot_path() -> PathBuf {
@@ -103,9 +135,10 @@ pub(crate) fn temp_snapshot_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // Includes a nanosecond timestamp, not just the PID, because background
-    // diagnosis threads (see `maybe_diagnose_alert_async`) can call `ask()`
-    // concurrently within the same process — a PID-only name would race.
+    // Includes a nanosecond timestamp, not just the PID, as a defensive
+    // uniqueness guarantee in case multiple invocations ever overlap — cheap
+    // to keep even though nothing in the current codebase actually calls
+    // `ask()` concurrently within one process.
     p.push(format!("vigil-snapshot-{}-{nanos}.json", std::process::id()));
     p
 }
@@ -150,45 +183,33 @@ mod tests {
 
     #[test]
     fn build_diagnosis_question_includes_the_alert_message() {
-        let q = build_diagnosis_question("pycharm has held 129% CPU", None, None, None);
+        let q = build_diagnosis_question("pycharm has held 129% CPU", None, None);
         assert!(q.contains("pycharm has held 129% CPU"));
     }
 
     #[test]
-    fn build_diagnosis_question_includes_recent_context_when_present() {
-        let q = build_diagnosis_question("high load", Some("swap is 91% full"), None, None);
-        assert!(q.contains("swap is 91% full"));
-    }
-
-    #[test]
-    fn build_diagnosis_question_omits_context_note_when_none() {
-        let q = build_diagnosis_question("high load", None, None, None);
-        assert!(!q.contains("also fired recently"));
-    }
-
-    #[test]
     fn build_diagnosis_question_points_at_the_watch_log_when_given_a_path() {
-        let q = build_diagnosis_question("high load", None, Some("/Users/denis/.vigil/watch.jsonl"), None);
+        let q = build_diagnosis_question("high load", Some("/Users/denis/.vigil/watch.jsonl"), None);
         assert!(q.contains("/Users/denis/.vigil/watch.jsonl"));
         assert!(q.contains("growing over"));
     }
 
     #[test]
     fn build_diagnosis_question_omits_history_note_without_a_watch_log_path() {
-        let q = build_diagnosis_question("high load", None, None, None);
+        let q = build_diagnosis_question("high load", None, None);
         assert!(!q.contains("growing over"));
     }
 
     #[test]
     fn build_diagnosis_question_includes_the_command_line_and_a_pid_reuse_warning() {
-        let q = build_diagnosis_question("claude (pid 27339) has held 177% CPU", None, None, Some("bfs -S dfs / -path *"));
+        let q = build_diagnosis_question("claude (pid 27339) has held 177% CPU", None, Some("bfs -S dfs / -path *"));
         assert!(q.contains("bfs -S dfs / -path *"));
         assert!(q.contains("pids get reused"));
     }
 
     #[test]
     fn build_diagnosis_question_omits_command_note_when_none() {
-        let q = build_diagnosis_question("high load", None, None, None);
+        let q = build_diagnosis_question("high load", None, None);
         assert!(!q.contains("pids get reused"));
     }
 
@@ -197,7 +218,7 @@ mod tests {
         // An empty `cmd` happens when the process was sampled mid
         // fork/exec -- nothing useful to quote, so no note rather than a
         // confusing empty backtick-quote.
-        let q = build_diagnosis_question("high load", None, None, Some(""));
+        let q = build_diagnosis_question("high load", None, Some(""));
         assert!(!q.contains("pids get reused"));
     }
 
@@ -212,25 +233,6 @@ mod tests {
     }
 
     #[test]
-    fn teaser_skips_markdown_heading_to_reach_real_content() {
-        let text = "## Diagnosis\n\nSwap is 91% full, pycharm is the top consumer.\n\n## Suggestions\n1. Restart it.";
-        assert_eq!(teaser(text, 200), "Swap is 91% full, pycharm is the top consumer.");
-    }
-
-    #[test]
-    fn teaser_truncates_long_lines_with_ellipsis() {
-        let long = "a".repeat(300);
-        let t = teaser(&long, 50);
-        assert_eq!(t.chars().count(), 51); // 50 chars + ellipsis
-        assert!(t.ends_with('…'));
-    }
-
-    #[test]
-    fn teaser_falls_back_to_whole_text_when_only_headings_present() {
-        assert_eq!(teaser("## Just A Heading", 200), "## Just A Heading");
-    }
-
-    #[test]
     fn temp_snapshot_path_is_unique_per_process() {
         let p = temp_snapshot_path();
         assert!(p.to_string_lossy().contains(&std::process::id().to_string()));
@@ -238,26 +240,70 @@ mod tests {
 
     #[test]
     fn temp_snapshot_path_is_unique_across_concurrent_calls() {
-        // Guards against the race a PID-only filename would have with
-        // `maybe_diagnose_alert_async` spawning concurrent `ask()` calls.
+        // Guards against a PID-only filename colliding if `ask()` is ever
+        // called twice in quick succession within one process (nothing
+        // currently does this, but the guarantee is cheap to keep).
         let a = temp_snapshot_path();
         let b = temp_snapshot_path();
         assert_ne!(a, b);
     }
 
     #[test]
-    fn auto_diagnose_worthy_for_cpu_and_battery_alerts() {
-        assert!(is_auto_diagnose_worthy("high_load"));
-        assert!(is_auto_diagnose_worthy("cpu_hog:1234"));
-        assert!(is_auto_diagnose_worthy("battery_low"));
-        assert!(is_auto_diagnose_worthy("high_process_count:node"));
+    fn journal_worthy_for_cpu_and_battery_alerts() {
+        assert!(is_journal_worthy("high_load"));
+        assert!(is_journal_worthy("cpu_hog:1234"));
+        assert!(is_journal_worthy("battery_low"));
+        assert!(is_journal_worthy("high_process_count:node"));
     }
 
     #[test]
-    fn auto_diagnose_not_worthy_for_disk_and_memory_alerts() {
-        assert!(!is_auto_diagnose_worthy("low_disk:/"));
-        assert!(!is_auto_diagnose_worthy("low_memory"));
-        assert!(!is_auto_diagnose_worthy("swap_pressure"));
+    fn not_journal_worthy_for_disk_and_memory_alerts() {
+        assert!(!is_journal_worthy("low_disk:/"));
+        assert!(!is_journal_worthy("low_memory"));
+        assert!(!is_journal_worthy("swap_pressure"));
+    }
+
+    #[test]
+    fn augment_with_investigate_hint_appends_the_command_and_keeps_other_fields() {
+        let alert = crate::alerts::Alert {
+            key: "cpu_hog:37489".to_string(),
+            title: "vigil: process hogging CPU".to_string(),
+            message: "pycharm (pid 37489) has held 204% CPU".to_string(),
+            target: Some("pycharm".to_string()),
+            command: Some("/Applications/PyCharm.app/Contents/MacOS/pycharm".to_string()),
+        };
+        let augmented = augment_with_investigate_hint(&alert, Some("/Users/denis/.vigil/watch.jsonl"));
+        assert!(augmented.message.contains("pycharm (pid 37489) has held 204% CPU"));
+        assert!(augmented.message.contains("vigil investigate cpu_hog:37489"));
+        assert!(augmented.message.contains("--watch-log /Users/denis/.vigil/watch.jsonl"));
+        assert_eq!(augmented.key, alert.key);
+        assert_eq!(augmented.title, alert.title);
+        assert_eq!(augmented.target, alert.target);
+        assert_eq!(augmented.command, alert.command);
+    }
+
+    #[test]
+    fn augment_with_investigate_hint_omits_watch_log_flag_when_none() {
+        let alert = crate::alerts::Alert {
+            key: "high_load".to_string(),
+            title: "vigil: high load".to_string(),
+            message: "Load average 25.0".to_string(),
+            target: Some("high_load".to_string()),
+            command: None,
+        };
+        let augmented = augment_with_investigate_hint(&alert, None);
+        assert!(!augmented.message.contains("--watch-log"));
+        assert!(augmented.message.contains("vigil investigate high_load"));
+    }
+
+    #[test]
+    fn build_execute_args_wires_project_dir_and_plan_json() {
+        let args = build_execute_args(r#"[{"category":"kill_process"}]"#, "agent");
+        assert_eq!(args[0], "uv");
+        assert_eq!(args[1], "run");
+        assert!(args.windows(2).any(|w| w == ["--project".to_string(), "agent".to_string()]));
+        assert_eq!(args.last().unwrap(), r#"[{"category":"kill_process"}]"#);
+        assert!(args.contains(&"execute".to_string()));
     }
 
     fn output_with(success: bool, stdout: &str, stderr: &str) -> std::process::Output {
