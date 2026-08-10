@@ -85,6 +85,31 @@ pub enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Investigate an alert: runs the read-only diagnosis agent against
+    /// the incident it fired, appending a `## Agent diagnosis` section
+    /// (and, if the agent identifies one, a `## Proposed fix`)
+    Investigate {
+        /// Alert key to investigate, e.g. `cpu_hog:37489` (shown in the notification)
+        alert_key: String,
+        /// Path to the vigil_agent project directory
+        #[arg(long, default_value = "agent")]
+        agent_dir: String,
+        /// Directory the incident journal is stored in
+        #[arg(long, default_value_t = default_incidents_dir())]
+        incidents_dir: String,
+        /// Optional path to a persistent watch.jsonl history for trend context
+        #[arg(long)]
+        watch_log: Option<String>,
+    },
+    /// Execute a fix plan an earlier `vigil investigate` proposed, after
+    /// interactive per-step approval
+    Fix {
+        /// Path to an incident file containing a `## Proposed fix` block
+        incident_file: String,
+        /// Path to the vigil_agent project directory
+        #[arg(long, default_value = "agent")]
+        agent_dir: String,
+    },
     /// Menu bar health indicator — transparent when healthy, yellow/red otherwise
     Menubar {
         /// Status file written by `vigil watch` (see --status-file there)
@@ -121,5 +146,23 @@ mod tests {
     fn default_status_file_matches_the_menubar_module_default() {
         assert_eq!(default_status_file(), crate::menubar::default_status_file().to_string_lossy().to_string());
         assert!(default_status_file().ends_with(".vigil/status.json"));
+    }
+
+    #[test]
+    fn investigate_parses_the_alert_key_positional_argument() {
+        let cli = Cli::try_parse_from(["vigil", "investigate", "cpu_hog:37489"]).unwrap();
+        match cli.command {
+            Commands::Investigate { alert_key, .. } => assert_eq!(alert_key, "cpu_hog:37489"),
+            _ => panic!("expected Investigate"),
+        }
+    }
+
+    #[test]
+    fn fix_parses_the_incident_file_positional_argument() {
+        let cli = Cli::try_parse_from(["vigil", "fix", "/tmp/some-incident.md"]).unwrap();
+        match cli.command {
+            Commands::Fix { incident_file, .. } => assert_eq!(incident_file, "/tmp/some-incident.md"),
+            _ => panic!("expected Fix"),
+        }
     }
 }

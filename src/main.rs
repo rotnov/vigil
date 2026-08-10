@@ -57,6 +57,12 @@ fn main() {
         Commands::Incidents { dir, show, limit } => {
             std::process::exit(incidents_cmd::run(&dir, show.as_deref(), limit));
         }
+        Commands::Investigate { alert_key, agent_dir, incidents_dir, watch_log } => {
+            std::process::exit(investigate_process::run(&alert_key, &agent_dir, &incidents_dir, watch_log.as_deref()));
+        }
+        Commands::Fix { incident_file, agent_dir } => {
+            std::process::exit(fix_process::run(&incident_file, &agent_dir));
+        }
         Commands::Menubar { status_file, incidents_dir, poll_secs } => {
             menubar_loop::run(menubar::MenubarOptions { status_file, incidents_dir, poll_interval: Duration::from_secs(poll_secs) });
         }
