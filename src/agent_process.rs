@@ -26,6 +26,19 @@ pub fn ask(question: &str, snapshot_json: &str, agent_dir: &str) -> Result<Strin
     interpret_output(&output)
 }
 
+/// Spawn `uv run vigil-agent execute --plan-json <json>` and return its
+/// stdout (trimmed) or an error — same shape as `ask`, for the same
+/// reason: this does real, costly work (a real Claude Agent SDK session,
+/// this time with some Bash patterns unlocked per `plan_json`'s
+/// categories) that a unit test shouldn't trigger, hence this file's
+/// coverage exclusion.
+pub fn execute_fix(plan_json: &str, agent_dir: &str) -> Result<String, String> {
+    let args = crate::agent::build_execute_args(plan_json, agent_dir);
+    let output = std::process::Command::new(&args[0]).args(&args[1..]).output();
+    let output = output.map_err(|e| format!("failed to launch vigil-agent (is `uv` installed?): {e}"))?;
+    crate::agent::interpret_output(&output)
+}
+
 /// If `alert` is worth it, ask the agent to investigate in a background
 /// thread and fire a follow-up notification with the answer once ready.
 /// Never blocks the caller. The agent has real (read-only) investigation
