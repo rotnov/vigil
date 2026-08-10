@@ -85,6 +85,7 @@ pub fn run(args: WatchArgs) {
                             alert_key: &alert.key,
                             alert_title: &alert.title,
                             alert_message: &alert.message,
+                            command: alert.command.as_deref(),
                         };
                         match crate::incidents::write_stub(incidents_dir, &stub) {
                             Ok(_) => {

@@ -3,8 +3,9 @@
 //!
 //! A new incident on a journal-worthy alert (see `agent::is_journal_worthy`
 //! — not every firing alert key qualifies, to keep this journal bounded)
-//! writes a stub immediately (`write_stub`): title, alert key, rule message
-//! only, no diagnosis yet. `vigil investigate <key>` appends a `## Agent
+//! writes a stub immediately (`write_stub`): title, alert key, rule message,
+//! and (when the alert was process-specific) the process's command line at
+//! fire time — no diagnosis yet. `vigil investigate <key>` appends a `## Agent
 //! diagnosis` section later (`append_diagnosis`), and `vigil fix <file>`
 //! appends a `## Fix execution` section after that (`append_fix_execution`)
 //! if the diagnosis proposed one. Nothing here runs automatically — see
@@ -38,21 +39,30 @@ pub struct IncidentStub<'a> {
     pub alert_key: &'a str,
     pub alert_title: &'a str,
     pub alert_message: &'a str,
+    pub command: Option<&'a str>,
 }
 
 /// Write a new incident file into `dir` (created if missing): title, alert
-/// key, and rule message only — no diagnosis section. Returns the path
-/// written, which the caller (a notification, an interactive prompt) can
-/// point back at.
+/// key, rule message, and — when the alert was process-specific and a
+/// command line was captured — a `**Command:**` line (see `extract_command`
+/// for why this is carried through: it's the pid-reuse defense from
+/// incident `2026-08-07-14-20-56-cpu-hog-27339.md`, now surviving the gap
+/// until a later `vigil investigate` run). No diagnosis section yet.
+/// Returns the path written, which the caller (a notification, an
+/// interactive prompt) can point back at.
 pub fn write_stub(dir: &Path, stub: &IncidentStub) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("failed to create incidents dir {}: {e}", dir.display()))?;
 
     let filename = format!("{}-{}.md", timestamp_prefix(), slugify(stub.alert_key));
     let path = dir.join(filename);
 
+    let command_line = match stub.command {
+        Some(cmd) if !cmd.is_empty() => format!("\n\n**Command:** {cmd}"),
+        _ => String::new(),
+    };
     let body = format!(
-        "# {}\n\n**Alert key:** `{}`\n\n**Rule message:** {}\n",
-        stub.alert_title, stub.alert_key, stub.alert_message
+        "# {}\n\n**Alert key:** `{}`\n\n**Rule message:** {}{}\n",
+        stub.alert_title, stub.alert_key, stub.alert_message, command_line
     );
     let f = std::fs::File::create(&path).map_err(|e| format!("failed to create {}: {e}", path.display()))?;
     write_or_err(f, &body, &path)?;
@@ -137,6 +147,20 @@ pub fn extract_rule_message(content: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The text after `**Command:**` on its own line, if the stub captured
+/// one — the process's full command line at the moment the alert fired,
+/// carried through so `vigil investigate` (which may run long after the
+/// fact) can still warn the agent about pid reuse. Absent when the alert
+/// wasn't process-specific or the command was empty at capture time (see
+/// `write_stub`).
+pub fn extract_command(content: &str) -> Option<&str> {
+    content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("**Command:**"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 /// `alert.key` values can contain `:`/other punctuation (e.g. `cpu_hog:1234`)
 /// that isn't filename-safe — normalize to lowercase hyphen-separated words.
 /// `pub(crate)` (not private) because `investigate.rs` needs the exact same
@@ -208,6 +232,7 @@ mod tests {
             alert_key: "high_load",
             alert_title: "vigil: high load",
             alert_message: "Load average 12.0 ...",
+            command: None,
         };
 
         let path = write_stub(&dir, &stub).unwrap();
@@ -224,10 +249,46 @@ mod tests {
     }
 
     #[test]
+    fn write_stub_includes_the_command_line_when_present() {
+        let dir = test_dir();
+        let stub = IncidentStub {
+            alert_key: "cpu_hog:1",
+            alert_title: "vigil: cpu hog",
+            alert_message: "m",
+            command: Some("/usr/bin/pycharm --foo"),
+        };
+        let path = write_stub(&dir, &stub).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("**Command:** /usr/bin/pycharm --foo"));
+        assert_eq!(extract_command(&content), Some("/usr/bin/pycharm --foo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_stub_omits_the_command_line_when_none() {
+        let dir = test_dir();
+        let stub = IncidentStub { alert_key: "high_load", alert_title: "t", alert_message: "m", command: None };
+        let path = write_stub(&dir, &stub).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("**Command:**"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_stub_omits_the_command_line_when_empty() {
+        let dir = test_dir();
+        let stub = IncidentStub { alert_key: "cpu_hog:1", alert_title: "t", alert_message: "m", command: Some("") };
+        let path = write_stub(&dir, &stub).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("**Command:**"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_stub_creates_missing_directory() {
         let dir = test_dir();
         assert!(!dir.exists());
-        let stub = IncidentStub { alert_key: "battery_low", alert_title: "t", alert_message: "m" };
+        let stub = IncidentStub { alert_key: "battery_low", alert_title: "t", alert_message: "m", command: None };
         write_stub(&dir, &stub).unwrap();
         assert!(dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -242,7 +303,7 @@ mod tests {
         std::fs::set_permissions(&parent, perms).unwrap();
 
         let dir = parent.join("cant-create-this");
-        let stub = IncidentStub { alert_key: "k", alert_title: "t", alert_message: "m" };
+        let stub = IncidentStub { alert_key: "k", alert_title: "t", alert_message: "m", command: None };
         let result = write_stub(&dir, &stub);
 
         let mut writable = std::fs::metadata(&parent).unwrap().permissions();
@@ -261,7 +322,7 @@ mod tests {
         perms.set_readonly(true);
         std::fs::set_permissions(&dir, perms).unwrap();
 
-        let stub = IncidentStub { alert_key: "k", alert_title: "t", alert_message: "m" };
+        let stub = IncidentStub { alert_key: "k", alert_title: "t", alert_message: "m", command: None };
         let result = write_stub(&dir, &stub);
 
         let mut writable = std::fs::metadata(&dir).unwrap().permissions();
@@ -275,7 +336,7 @@ mod tests {
     #[test]
     fn append_diagnosis_adds_a_heading_and_body_after_the_stub() {
         let dir = test_dir();
-        let stub = IncidentStub { alert_key: "cpu_hog:1", alert_title: "vigil: cpu hog", alert_message: "m" };
+        let stub = IncidentStub { alert_key: "cpu_hog:1", alert_title: "vigil: cpu hog", alert_message: "m", command: None };
         let path = write_stub(&dir, &stub).unwrap();
 
         append_diagnosis(&path, "## Diagnosis\n\nThe culprit is pycharm.").unwrap();
@@ -300,7 +361,7 @@ mod tests {
     #[test]
     fn append_fix_execution_adds_its_own_heading_after_diagnosis() {
         let dir = test_dir();
-        let stub = IncidentStub { alert_key: "cpu_hog:1", alert_title: "vigil: cpu hog", alert_message: "m" };
+        let stub = IncidentStub { alert_key: "cpu_hog:1", alert_title: "vigil: cpu hog", alert_message: "m", command: None };
         let path = write_stub(&dir, &stub).unwrap();
         append_diagnosis(&path, "## Diagnosis\n\ntext\n\n## Proposed fix\n\n```json\n{}\n```").unwrap();
 
@@ -332,6 +393,17 @@ mod tests {
     #[test]
     fn extract_rule_message_is_none_when_the_field_is_absent() {
         assert_eq!(extract_rule_message("# t\n\nno rule message field here\n"), None);
+    }
+
+    #[test]
+    fn extract_command_reads_the_field_line() {
+        let content = "# t\n\n**Alert key:** `k`\n\n**Rule message:** m\n\n**Command:** /usr/bin/foo --bar\n";
+        assert_eq!(extract_command(content), Some("/usr/bin/foo --bar"));
+    }
+
+    #[test]
+    fn extract_command_is_none_when_the_field_is_absent() {
+        assert_eq!(extract_command("# t\n\n**Rule message:** m\n"), None);
     }
 
     #[test]

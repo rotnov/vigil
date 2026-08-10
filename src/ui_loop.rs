@@ -74,6 +74,7 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                                 alert_key: &alert.key,
                                 alert_title: &alert.title,
                                 alert_message: &alert.message,
+                                command: alert.command.as_deref(),
                             };
                             match crate::incidents::write_stub(incidents_dir, &stub) {
                                 // vigil ui's own snapshot loop doesn't write a persistent JSONL log
