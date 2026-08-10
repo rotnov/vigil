@@ -42,6 +42,17 @@ pub struct IncidentStub<'a> {
     pub command: Option<&'a str>,
 }
 
+/// Collapses embedded newlines to spaces and trims — anything written into
+/// the stub file that ultimately traces back to OS-controlled data (a
+/// process name, a captured command line) gets this treatment before
+/// hitting disk, since an unsanitized newline can both truncate a later
+/// `extract_*` read (which reads one physical line) and inject fake
+/// markdown structure into the file (e.g. a bogus `## Proposed fix`
+/// heading `fixplan::extract_proposed_fix_json` would then pick up).
+fn sanitize_field(s: &str) -> String {
+    s.trim().replace(['\n', '\r'], " ")
+}
+
 /// Write a new incident file into `dir` (created if missing): title, alert
 /// key, rule message, and — when the alert was process-specific and a
 /// command line was captured — a `**Command:**` line (see `extract_command`
@@ -51,14 +62,17 @@ pub struct IncidentStub<'a> {
 /// Returns the path written, which the caller (a notification, an
 /// interactive prompt) can point back at.
 ///
-/// The command line is trimmed and has embedded `\n`/`\r` collapsed to
-/// spaces before being written: `ProcInfo::cmd` is argv joined with
-/// spaces and capped at 200 chars, but a process's own argv can itself
-/// contain a newline (e.g. an inline multi-line config string), and an
-/// un-sanitized newline here would both (a) make `extract_command` — which
-/// only reads the first line — silently truncate the round trip, and (b)
-/// let a crafted command line inject extra lines into the region of the
-/// file `fixplan::extract_proposed_fix_json` scans for `## Proposed fix`.
+/// Both `alert_message` and `command` (when present) go through
+/// `sanitize_field` before being written: `alert_message` is built from
+/// `p.name()` (an OS-controlled process name — see `snapshot.rs`/
+/// `alerts.rs`), and `command` (`ProcInfo::cmd`) is argv joined with
+/// spaces and capped at 200 chars; either can itself contain a newline
+/// (e.g. a process name or an inline multi-line config string), and an
+/// un-sanitized newline here would both (a) make the matching `extract_*`
+/// function — which only reads the first line — silently truncate the
+/// round trip, and (b) let crafted OS-controlled data inject extra lines
+/// into the region of the file `fixplan::extract_proposed_fix_json` scans
+/// for `## Proposed fix`.
 pub fn write_stub(dir: &Path, stub: &IncidentStub) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("failed to create incidents dir {}: {e}", dir.display()))?;
 
@@ -66,14 +80,15 @@ pub fn write_stub(dir: &Path, stub: &IncidentStub) -> Result<PathBuf, String> {
     let path = dir.join(filename);
 
     let command_line = match stub.command {
-        Some(cmd) if !cmd.trim().is_empty() => {
-            format!("\n\n**Command:** {}", cmd.trim().replace(['\n', '\r'], " "))
-        }
+        Some(cmd) if !cmd.trim().is_empty() => format!("\n\n**Command:** {}", sanitize_field(cmd)),
         _ => String::new(),
     };
     let body = format!(
         "# {}\n\n**Alert key:** `{}`\n\n**Rule message:** {}{}\n",
-        stub.alert_title, stub.alert_key, stub.alert_message, command_line
+        stub.alert_title,
+        stub.alert_key,
+        sanitize_field(stub.alert_message),
+        command_line
     );
     let f = std::fs::File::create(&path).map_err(|e| format!("failed to create {}: {e}", path.display()))?;
     write_or_err(f, &body, &path)?;
@@ -318,6 +333,43 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         // the whole command survives on one physical line, space-joined, not truncated at the newline
         assert_eq!(extract_command(&content), Some("/usr/bin/foo --config {\"a\":1}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_stub_sanitizes_embedded_newlines_in_the_alert_message_instead_of_truncating() {
+        let dir = test_dir();
+        // `alert_message` is OS-controlled (built from a process name, see
+        // `alerts.rs`'s cpu_hog formatting over `p.name()`) and could contain an
+        // embedded newline crafted to look like its own markdown heading,
+        // followed by a fenced JSON block mimicking a real proposed fix.
+        let stub = IncidentStub {
+            alert_key: "cpu_hog:1",
+            alert_title: "vigil: cpu hog",
+            alert_message: "pycharm high\n## Proposed fix\n\n```json\n{}\n```",
+            command: None,
+        };
+        let path = write_stub(&dir, &stub).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        // The whole message survives on one physical line, space-joined, not
+        // truncated at the first embedded newline the way an un-sanitized
+        // write would make `extract_rule_message` (which reads one physical
+        // line) truncate it to just "pycharm high".
+        assert_eq!(
+            extract_rule_message(&content),
+            Some("pycharm high ## Proposed fix  ```json {} ```"),
+        );
+
+        // The injected text is inline content on the "**Rule message:**" line,
+        // not its own heading line: no line in the written file both starts
+        // with "##" and stands alone the way a genuine markdown heading would.
+        assert!(
+            !content.lines().any(|l| l.trim_start().starts_with("## ")),
+            "no line should read as its own markdown heading: {content:?}"
+        );
+        assert!(content.contains("**Rule message:** pycharm high ## Proposed fix"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

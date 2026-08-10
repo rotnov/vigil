@@ -20,7 +20,7 @@ pub fn resolve_incident_file(dir: &Path, alert_key: &str) -> Result<PathBuf, Str
     files
         .into_iter()
         .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().contains(&slug)))
-        .last()
+        .next_back()
         .ok_or_else(|| format!("no incident found for alert key \"{alert_key}\" in {}", dir.display()))
 }
 

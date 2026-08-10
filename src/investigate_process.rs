@@ -30,7 +30,7 @@ pub fn run(alert_key: &str, agent_dir: &str, incidents_dir: &str, watch_log: Opt
     let snapshot_json = serde_json::to_string(&snap).unwrap();
 
     let command = crate::incidents::extract_command(&content);
-    let question = crate::agent::build_diagnosis_question(rule_message, None, watch_log, command);
+    let question = crate::agent::build_diagnosis_question(rule_message, watch_log, command);
 
     match crate::agent_process::ask(&question, &snapshot_json, agent_dir) {
         Ok(answer) => match crate::incidents::append_diagnosis(&path, &answer) {
