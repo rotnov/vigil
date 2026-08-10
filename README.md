@@ -105,9 +105,10 @@ recycled by the OS to something unrelated by the time you check it: observed liv
 (see `2026-08-07-14-20-56-cpu-hog-27339.md`), an alert named "claude" whose pid had
 already become an unrelated `bfs` scan. Process-targeted alerts (`high_load`/
 `cpu_hog`/`battery_low`) capture the flagged process's full command line
-synchronously, at the moment they fire, as a guard against exactly that — worth
-double-checking yourself (`ps -p <pid> -o command`) if you run the investigation long
-after the alert notification.
+synchronously, at the moment they fire, and hand it to the agent when you later run
+`vigil investigate` — a guard against exactly that. Still worth double-checking
+yourself (`ps -p <pid> -o command`) as a sanity check, especially the longer you wait
+to investigate.
 
 Repeat firings are treated as one ongoing incident, not a fresh one each time:
 `alerts::IncidentTracker` skips the notification and the incident stub for a target
