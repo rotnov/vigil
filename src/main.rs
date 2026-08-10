@@ -7,6 +7,7 @@ mod fixplan;
 mod incidents;
 mod incidents_cmd;
 mod investigate;
+mod investigate_process;
 mod menubar;
 mod menubar_loop;
 mod notify;
