@@ -50,6 +50,15 @@ pub struct IncidentStub<'a> {
 /// until a later `vigil investigate` run). No diagnosis section yet.
 /// Returns the path written, which the caller (a notification, an
 /// interactive prompt) can point back at.
+///
+/// The command line is trimmed and has embedded `\n`/`\r` collapsed to
+/// spaces before being written: `ProcInfo::cmd` is argv joined with
+/// spaces and capped at 200 chars, but a process's own argv can itself
+/// contain a newline (e.g. an inline multi-line config string), and an
+/// un-sanitized newline here would both (a) make `extract_command` — which
+/// only reads the first line — silently truncate the round trip, and (b)
+/// let a crafted command line inject extra lines into the region of the
+/// file `fixplan::extract_proposed_fix_json` scans for `## Proposed fix`.
 pub fn write_stub(dir: &Path, stub: &IncidentStub) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("failed to create incidents dir {}: {e}", dir.display()))?;
 
@@ -57,7 +66,9 @@ pub fn write_stub(dir: &Path, stub: &IncidentStub) -> Result<PathBuf, String> {
     let path = dir.join(filename);
 
     let command_line = match stub.command {
-        Some(cmd) if !cmd.is_empty() => format!("\n\n**Command:** {cmd}"),
+        Some(cmd) if !cmd.trim().is_empty() => {
+            format!("\n\n**Command:** {}", cmd.trim().replace(['\n', '\r'], " "))
+        }
         _ => String::new(),
     };
     let body = format!(
@@ -281,6 +292,32 @@ mod tests {
         let path = write_stub(&dir, &stub).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains("**Command:**"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_stub_omits_the_command_line_when_whitespace_only() {
+        let dir = test_dir();
+        let stub = IncidentStub { alert_key: "cpu_hog:1", alert_title: "t", alert_message: "m", command: Some("   ") };
+        let path = write_stub(&dir, &stub).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("**Command:**"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_stub_collapses_embedded_newlines_in_the_command_line_instead_of_truncating() {
+        let dir = test_dir();
+        let stub = IncidentStub {
+            alert_key: "cpu_hog:1",
+            alert_title: "t",
+            alert_message: "m",
+            command: Some("/usr/bin/foo --config\n{\"a\":1}"),
+        };
+        let path = write_stub(&dir, &stub).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        // the whole command survives on one physical line, space-joined, not truncated at the newline
+        assert_eq!(extract_command(&content), Some("/usr/bin/foo --config {\"a\":1}"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
