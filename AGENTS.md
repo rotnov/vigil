@@ -11,10 +11,10 @@ heavier process from other projects wholesale just because it exists elsewhere.
 Everything vigil does should serve one goal: keep the machine's own performance at its
 max while on AC power, and conserve battery while on battery power. This governs
 judgment calls, not just user-facing features — vigil's *own* overhead counts against
-this goal too. `alerts::IncidentTracker` exists because repeated notifications,
-diagnoses, and journal entries for one ongoing condition was real CPU/token/attention
-cost working against exactly this goal. When evaluating a proposed change, ask whether
-it moves the machine toward or away from this, including the cost vigil itself adds.
+this goal too. `alerts::IncidentTracker` exists because repeated notifications and
+journal entries for one ongoing condition was real CPU/token/attention cost working
+against exactly this goal. When evaluating a proposed change, ask whether it moves
+the machine toward or away from this, including the cost vigil itself adds.
 
 ## Core architectural rule: Rust never decides or fixes anything
 
@@ -29,8 +29,11 @@ it moves the machine toward or away from this, including the cost vigil itself a
   `agent::is_journal_worthy` returns true for (`high_load`, `cpu_hog:*`,
   `battery_low`, `high_process_count:*`) — also writes a stub incident file
   (`incidents::write_stub`: title, alert key, rule message, nothing else); other
-  keys (disk/connection/memory-pressure alerts have no dedup key and would fire
-  unboundedly) get only the plain notification, same as before this whole plan. No
+  keys get only the plain notification, same as before this whole plan
+  (`low_disk:<mount>`/`high_connection_count`/`incoming_connections` are
+  targetless and would fire unboundedly if journaled; `swap_pressure`/`low_memory`
+  dedupe fine via `IncidentTracker` just like `high_load` does but are simply
+  outside the journal-worthy set by design, left to the interactive `a` flow). No
   agent process spawns until the user explicitly runs that command.
 - `vigil investigate` runs the same read-only investigation agent as the
   interactive `a`-key ask in `vigil ui` — identical contract either way, same
@@ -155,10 +158,8 @@ it moves the machine toward or away from this, including the cost vigil itself a
     (check `echo $?` on both a match and a miss — `Commands::Incidents` goes through
     `std::process::exit`), `vigil menubar` launched briefly and killed, `vigil
     investigate <key>` against a hand-written stub incident file (spends real agent
-    tokens — see the Testing section's Python bullet for the equivalent
-    `vigil-agent execute --help` check), and `vigil fix <file>` against an incident
-    with a `## Proposed fix` block, approving then rejecting a step to confirm both
-    paths.
+    tokens), and `vigil fix <file>` against an incident with a `## Proposed fix`
+    block, approving then rejecting a step to confirm both paths.
 
 ## Decisions (ADRs)
 
@@ -176,8 +177,7 @@ it moves the machine toward or away from this, including the cost vigil itself a
 - Smaller calls (a threshold constant, a cooldown value, a struct field) don't need
   their own ADR — a clear commit message explaining the "why" is enough, consistent
   with how the live incident-driven improvement cycle has worked so far (e.g.
-  `alerts::RecentAlerts`, `alerts::IncidentTracker` shipped on commit-message
-  rationale alone, no ADR).
+  `alerts::IncidentTracker` shipped on commit-message rationale alone, no ADR).
 
 ## The live incident-monitoring loop
 
@@ -185,9 +185,13 @@ it moves the machine toward or away from this, including the cost vigil itself a
   exact command to investigate it — `vigil investigate <alert-key>` — but does not
   itself spawn an agent. Only alert keys `agent::is_journal_worthy` returns true for
   (`high_load`, `cpu_hog:*`, `battery_low`, `high_process_count:*`) also get a stub
-  incident file (`incidents::write_stub`); other keys (disk/connection/
-  memory-pressure alerts) fire a plain notification only, same as before this whole
-  plan. Every incident file that does get written lives at
+  incident file (`incidents::write_stub`); other keys fire a plain notification
+  only, same as before this whole plan
+  (`low_disk:<mount>`/`high_connection_count`/`incoming_connections` are
+  targetless and would fire unboundedly if journaled; `swap_pressure`/`low_memory`
+  dedupe fine via `IncidentTracker` but are simply outside the journal-worthy set
+  by design, left to the interactive `a` flow). Every incident file that does get
+  written lives at
   `~/.vigil/incidents/<date>-<time>-<slug>.md` — a fixed, home-relative path (vigil
   is meant to run from anywhere, not just its own repo). The interactive `a`-key ask
   in `vigil ui` is deliberately NOT journaled — on-screen only, by design.
