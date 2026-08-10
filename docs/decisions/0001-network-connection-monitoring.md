@@ -6,6 +6,9 @@ status: accepted
 
 ## 0001: Network connection monitoring
 
+Note: `agent::is_auto_diagnose_worthy`, referenced below, was later replaced by
+`agent::is_journal_worthy` — see ADR 0006.
+
 - Status: accepted
 - Context: vigil had no network visibility at all — no field in `Snapshot`, no alert
   rule, `sysinfo` (already a dependency) exposes only interface-level RX/TX byte

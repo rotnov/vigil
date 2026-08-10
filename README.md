@@ -65,7 +65,8 @@ not hide.
 
 Nothing runs automatically when an alert fires. For `high_load`, `cpu_hog:*`,
 `battery_low`, and `high_process_count:*`, vigil writes a stub incident file
-(title, alert key, rule message) to
+(title, alert key, rule message, and — for process-specific alerts that captured
+one — a `**Command:**` line with the process's command line at fire time) to
 `~/.vigil/incidents/<date>-<time>-<slug>.md` (override with `--incidents-dir`) and
 notifies with the command to investigate it. Other alert keys (low disk, connection
 counts, swap/memory pressure) just fire a plain notification, same as before this

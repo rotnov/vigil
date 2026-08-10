@@ -65,11 +65,11 @@ pub enum Commands {
         /// Path to the vigil_agent project directory (for the in-UI "ask" feature)
         #[arg(long, default_value = "agent")]
         agent_dir: String,
-        /// Directory for the auto-diagnosis incident journal (markdown, one file per diagnosis)
+        /// Directory for the incident journal (markdown, one stub file per alert-worthy incident)
         #[arg(long, default_value_t = default_incidents_dir())]
         incidents_dir: String,
     },
-    /// Browse the auto-diagnosis incident journal (no TUI session required)
+    /// Browse the incident journal (no TUI session required)
     Incidents {
         /// Directory the incident journal is stored in
         #[arg(long, default_value_t = default_incidents_dir())]

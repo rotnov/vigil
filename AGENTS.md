@@ -28,7 +28,8 @@ the machine toward or away from this, including the cost vigil itself adds.
   to run, `vigil investigate <alert-key>`, and — only for alert keys
   `agent::is_journal_worthy` returns true for (`high_load`, `cpu_hog:*`,
   `battery_low`, `high_process_count:*`) — also writes a stub incident file
-  (`incidents::write_stub`: title, alert key, rule message, nothing else); other
+  (`incidents::write_stub`: title, alert key, rule message, plus a `**Command:**`
+  line when the alert was process-specific and captured one — nothing else); other
   keys get only the plain notification, same as before this whole plan
   (`low_disk:<mount>`/`high_connection_count`/`incoming_connections` are
   targetless and would fire unboundedly if journaled; `swap_pressure`/`low_memory`
@@ -185,7 +186,8 @@ the machine toward or away from this, including the cost vigil itself adds.
   exact command to investigate it — `vigil investigate <alert-key>` — but does not
   itself spawn an agent. Only alert keys `agent::is_journal_worthy` returns true for
   (`high_load`, `cpu_hog:*`, `battery_low`, `high_process_count:*`) also get a stub
-  incident file (`incidents::write_stub`); other keys fire a plain notification
+  incident file (`incidents::write_stub` — title, alert key, rule message, plus a
+  `**Command:**` line when one was captured); other keys fire a plain notification
   only, same as before this whole plan
   (`low_disk:<mount>`/`high_connection_count`/`incoming_connections` are
   targetless and would fire unboundedly if journaled; `swap_pressure`/`low_memory`

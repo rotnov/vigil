@@ -28,8 +28,9 @@ status: accepted
      alert loop alike; the interactive `a`/`w`-key ask is unaffected. Only alert
      keys `agent::is_journal_worthy` returns true for (`high_load`, `cpu_hog:*`,
      `battery_low`, `high_process_count:*`) also get a stub incident file written
-     (`incidents::write_stub` — title, alert key, rule message, nothing else);
-     other keys get only the plain notification, same as before this whole
+     (`incidents::write_stub` — title, alert key, rule message, and, for
+     process-specific alerts that captured one, a `**Command:**` line — nothing
+     else); other keys get only the plain notification, same as before this whole
      feature. This gating was added during implementation, discovered via a Task 9
      review bug: writing a stub for *every* alert firing would cause unbounded
      incident-journal growth for targetless alerts — `low_disk:<mount>`,
