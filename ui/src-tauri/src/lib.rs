@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tauri::{AppHandle, Listener, Manager};
+use tauri::{AppHandle, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_notification::NotificationExt;
 
@@ -303,6 +303,16 @@ fn spawn_incident_poller(app: AppHandle, ready: Arc<WindowReady>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Shared between the `.on_page_load(...)` hook below (registered on the
+    // `Builder` chain, before any window exists) and `.setup()`'s closure
+    // (the deep-link paths and the poller) -- both need the same `ready` so
+    // a navigation attempted anywhere before the "main" webview's first
+    // load completes gets queued, and the queue drains exactly once when
+    // that load actually finishes.
+    let ready = WindowReady::new();
+    let ready_for_page_load = ready.clone();
+    let ready_for_setup = ready.clone();
+
     tauri::Builder::default()
         // Must be the first `.plugin(...)` call -- it needs to intercept
         // app startup (and decide whether this process should even keep
@@ -338,7 +348,38 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
-        .setup(|app| {
+        // The real "has the main webview finished its first load" signal.
+        // An earlier version of this fix listened for a window event named
+        // `tauri://load`, which does not exist in Tauri 2.11.5 -- checked
+        // directly against this crate's own source
+        // (`tauri-2.11.5/src/manager/window.rs`'s `EventName::from_str`
+        // constants list every `tauri://`-namespaced window event it
+        // actually emits: resize/move/close-requested/destroyed/focus/
+        // blur/scale-change/theme-changed/drag-*/suspended/resumed/
+        // webview-created/window-created -- no `load`), so that listener
+        // would never have fired and `ready` would have stayed `false` for
+        // the process's entire lifetime, queuing every incident forever
+        // instead of just the racy first one. `Builder::on_page_load` is
+        // the hook Tauri actually documents for this
+        // (`tauri-2.11.5/src/webview/webview_window.rs`'s own doc example),
+        // firing with `PageLoadEvent::Started`/`Finished` for every webview
+        // page load, this app's initial one included. Filtered to the
+        // "main" webview (the only one this app creates) and to
+        // `Finished`; `swap` instead of `load`+`store` so a later
+        // navigation firing this same hook again (including this fix's own
+        // `navigate_to_incident` calls, which themselves trigger a new page
+        // load) is a no-op rather than re-draining an already-empty queue.
+        .on_page_load(move |webview, payload| {
+            if webview.label() != "main" || payload.event() != tauri::webview::PageLoadEvent::Finished {
+                return;
+            }
+            if !ready_for_page_load.ready.swap(true, Ordering::SeqCst) {
+                if let Some((path, focus)) = ready_for_page_load.pending.lock().unwrap().take() {
+                    navigate_to_incident(webview.app_handle(), &path, focus);
+                }
+            }
+        })
+        .setup(move |app| {
             // `LSUIElement` in Info.plist does NOT suppress the Dock icon
             // on this installed Tauri/tao combination -- tao's AppDelegate
             // hardcodes ActivationPolicy::Regular unconditionally on every
@@ -351,17 +392,11 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             let _ = app.handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let ready = WindowReady::new();
-            if let Some(window) = app.get_webview_window("main") {
-                let ready_for_load = ready.clone();
-                let handle_for_load = app.handle().clone();
-                window.once("tauri://load", move |_event| {
-                    ready_for_load.ready.store(true, Ordering::SeqCst);
-                    if let Some((path, focus)) = ready_for_load.pending.lock().unwrap().take() {
-                        navigate_to_incident(&handle_for_load, &path, focus);
-                    }
-                });
-            }
+            // `ready_for_setup` is the same `WindowReady` the
+            // `.on_page_load(...)` hook above flips once the "main"
+            // webview's first load actually completes -- these paths, and
+            // that hook, share one queue.
+            let ready = ready_for_setup;
 
             let handle = app.handle().clone();
             // Cold start: the app was launched *by* a `vigil://` URL.
