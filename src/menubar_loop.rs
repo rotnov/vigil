@@ -93,7 +93,12 @@ pub fn run(opts: MenubarOptions) {
                 if menu_event.id == "quit" {
                     *control_flow = ControlFlow::Exit;
                 } else if let Some(path) = incident_paths.iter().find(|p| p.to_string_lossy() == menu_event.id.0) {
-                    let _ = std::process::Command::new("open").arg(path).spawn();
+                    // Hand off to vigil-ui instead of opening raw markdown —
+                    // see docs/superpowers/specs/2026-08-12-investigate-ui-design.md.
+                    // macOS routes this URL to vigil-ui via the `vigil://`
+                    // scheme it registers (tauri-plugin-deep-link, Task 9).
+                    let url = format!("vigil://incident/{}", urlencoding::encode(&path.to_string_lossy()));
+                    let _ = std::process::Command::new("open").arg(url).spawn();
                 }
             }
             _ => {}
