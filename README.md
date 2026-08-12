@@ -181,6 +181,25 @@ Requires an installed and logged-in [Claude Code](https://claude.com/claude-code
 ./target/release/vigil menubar
 ```
 
+### Running `vigil-ui` persistently
+
+`vigil-ui` needs to be running for journal-worthy alert notifications to
+appear at all (see [docs/superpowers/specs/2026-08-12-investigate-ui-design.md](docs/superpowers/specs/2026-08-12-investigate-ui-design.md)) —
+install it as a LaunchAgent so it survives reboots:
+
+```bash
+cp ui/com.vigil.ui.plist ~/Library/LaunchAgents/com.vigil.ui.plist
+launchctl load ~/Library/LaunchAgents/com.vigil.ui.plist
+```
+
+`vigil-ui`'s "investigate"/"fix" actions require `VIGIL_BIN`/`VIGIL_AGENT_DIR`
+to be set correctly in the plist for wherever `vigil` is actually checked out
+and built on the machine running it — the committed plist bakes in this
+maintainer's own checkout path as a default, so a reader deploying it
+themselves needs to adjust both paths to their own checkout location.
+
+To stop it: `launchctl unload ~/Library/LaunchAgents/com.vigil.ui.plist`.
+
 ## Tests
 
 ```bash
