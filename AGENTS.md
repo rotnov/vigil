@@ -35,7 +35,9 @@ the machine toward or away from this, including the cost vigil itself adds.
   targetless and would fire unboundedly if journaled; `swap_pressure`/`low_memory`
   dedupe fine via `IncidentTracker` just like `high_load` does but are simply
   outside the journal-worthy set by design, left to the interactive `a` flow). No
-  agent process spawns until the user explicitly runs that command.
+  agent process spawns until the user explicitly runs that command. For the
+  journal-worthy subset, that notification is now posted by `vigil-ui`, not
+  `vigil watch` itself — see "The live incident-monitoring loop" below.
 - `vigil investigate` runs the same read-only investigation agent as the
   interactive `a`-key ask in `vigil ui` — identical contract either way, same
   `agent/src/vigil_agent/diagnose.py` config:
@@ -109,6 +111,11 @@ the machine toward or away from this, including the cost vigil itself adds.
   allowed and the destructive Bash patterns stay denylisted), and a `pytest-cov` gate
   (`--cov-fail-under=99.9`, configured in `agent/pyproject.toml`). Run this whenever
   `agent/` changes.
+- `cd ui/src-tauri && cargo test` — `vigil-ui`'s Rust backend: subprocess arg/stdin
+  building for `vigil investigate`/`vigil fix`, incident-file JSON parsing, the
+  `vigil://incident/<path>` URL parsing, the process-tree query — same
+  pure-logic-separate-from-OS-boundary-glue split as the rest of this project. Three
+  test suites now, not two; run this whenever `ui/` changes.
 - New Rust logic gets a pure, unit-testable function kept separate from any
   `Command`/IO call — the same split `parse_battery_line`/`parse_netstat_output`/
   `build_args` already have from `read_battery`/`collect_connections`/`ask`'s actual
@@ -197,6 +204,12 @@ the machine toward or away from this, including the cost vigil itself adds.
   `~/.vigil/incidents/<date>-<time>-<slug>.md` — a fixed, home-relative path (vigil
   is meant to run from anywhere, not just its own repo). The interactive `a`-key ask
   in `vigil ui` is deliberately NOT journaled — on-screen only, by design.
+- `vigil-ui` — not `vigil watch`/`vigil ui` — is what actually posts the
+  notification for journal-worthy alerts now: it polls the incidents directory
+  itself and posts a real, clickable macOS notification that opens the diagnosis
+  window directly, so it needs to be running (as a `LaunchAgent`, per its README
+  section) for those alerts to notify at all; see
+  `docs/superpowers/specs/2026-08-12-investigate-ui-design.md` for the full design.
 - `vigil incidents` reads that journal from a plain shell (list recent, or `--show
   <name>` for one in full) — this exists specifically because a push notification
   can't spontaneously open an already-running `vigil ui` session.

@@ -183,8 +183,9 @@ Requires an installed and logged-in [Claude Code](https://claude.com/claude-code
 
 ### Running `vigil-ui` persistently
 
-`vigil-ui` needs to be running for journal-worthy alert notifications to
-appear at all (see [docs/superpowers/specs/2026-08-12-investigate-ui-design.md](docs/superpowers/specs/2026-08-12-investigate-ui-design.md)) —
+`vigil-ui` (the Tauri companion app described under Architecture below) needs
+to be running for journal-worthy alert notifications to appear at all (see
+[docs/superpowers/specs/2026-08-12-investigate-ui-design.md](docs/superpowers/specs/2026-08-12-investigate-ui-design.md)) —
 install it as a LaunchAgent so it survives reboots:
 
 ```bash
@@ -280,6 +281,22 @@ vigil (Rust)                            agent/ (Python, Claude Agent SDK)
 └── main.rs — Cli::parse() + dispatch
     to the module owning each subcommand
 ```
+
+A third top-level project, `ui/` (Tauri: a Rust backend plus a vanilla TS/HTML/CSS
+webview — a standard Tauri layout, not diagrammed file-by-file above since any
+Tauri-familiar reader already knows the shape), builds `vigil-ui`: a background-
+resident macOS companion app (no Dock icon, no tray icon of its own — `vigil
+menubar`'s is enough) that turns a journal-worthy incident into a glanceable
+window instead of a markdown file. Two things trigger it: `vigil menubar`'s
+dropdown click hands off an incident's path instead of opening the raw file, and
+`vigil-ui`'s own poller of `~/.vigil/incidents/` posts a real, clickable macOS
+notification for new journal-worthy stubs (see "The live incident-monitoring
+loop" in `AGENTS.md`). Either path opens a window with the diagnosis and a live
+process tree, entirely by shelling out to the same `vigil investigate`/`vigil
+fix`/`vigil incidents --show --json` CLI surface a terminal user already has — it
+has no diagnosis or execution logic of its own. See
+[docs/superpowers/specs/2026-08-12-investigate-ui-design.md](docs/superpowers/specs/2026-08-12-investigate-ui-design.md)
+for the full design.
 
 Project-wide design decisions with a real alternative (a parsing strategy, an alert
 heuristic, a new subsystem) are recorded under
