@@ -55,7 +55,7 @@ fn main() {
             ui_loop::run(opts).expect("ui failed");
         }
         Commands::Incidents { dir, show, limit } => {
-            std::process::exit(incidents_cmd::run(&dir, show.as_deref(), limit));
+            std::process::exit(incidents_cmd::run(&dir, show.as_deref(), limit, false));
         }
         Commands::Investigate { alert_key, agent_dir, incidents_dir, watch_log } => {
             std::process::exit(investigate_process::run(&alert_key, &agent_dir, &incidents_dir, watch_log.as_deref()));
