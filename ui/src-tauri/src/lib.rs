@@ -142,18 +142,30 @@ impl WindowReady {
 /// triggered by clicking a menu-bar item or notification, so focusing is
 /// the expected outcome there.
 fn open_incident_window(app: &AppHandle, ready: &WindowReady, path: &str, focus: bool) {
+    // Lock `pending` *before* checking `ready`, rather than checking
+    // `ready` first and only locking in the `else` branch -- otherwise
+    // there's a race against the `on_page_load` hook's own drain (see
+    // `run()`): this call could observe `ready == false`, get preempted,
+    // have the hook flip `ready` true and drain an already-empty
+    // `pending`, and only then write into `pending` -- which nothing
+    // would ever read again, since every later `on_page_load` firing hits
+    // the hook's `!swap(...)` guard and skips draining. Serializing both
+    // paths on the same mutex (the hook also locks `pending` before its
+    // own `swap`) closes that window entirely.
+    let mut pending = ready.pending.lock().unwrap();
     if ready.ready.load(Ordering::SeqCst) {
+        drop(pending);
         navigate_to_incident(app, path, focus);
     } else {
         // Too early -- the webview hasn't finished its first load yet.
-        // Queue it; the `tauri://load` listener registered in `run()`
-        // applies whatever's queued the moment it fires. A second queued
-        // path before the first one is ever applied simply overwrites the
-        // first (last-wins) -- in practice this only matters for the
-        // poller's very first few ticks before the window has loaded even
-        // once, a narrow window where at most one real incident is likely
-        // to land.
-        *ready.pending.lock().unwrap() = Some((path.to_string(), focus));
+        // Queue it; the `on_page_load` hook registered in `run()` applies
+        // whatever's queued once it observes the load actually finishing.
+        // A second queued path before the first one is ever applied
+        // simply overwrites the first (last-wins) -- in practice this
+        // only matters for the poller's very first few ticks before the
+        // window has loaded even once, a narrow window where at most one
+        // real incident is likely to land.
+        *pending = Some((path.to_string(), focus));
     }
 }
 
@@ -373,8 +385,15 @@ pub fn run() {
             if webview.label() != "main" || payload.event() != tauri::webview::PageLoadEvent::Finished {
                 return;
             }
+            // Lock `pending` *before* the `swap`, mirroring
+            // `open_incident_window`'s own lock-before-check ordering, so
+            // this drain and a concurrent `open_incident_window` call can
+            // never interleave (see that function's doc comment for the
+            // race this closes).
+            let mut pending = ready_for_page_load.pending.lock().unwrap();
             if !ready_for_page_load.ready.swap(true, Ordering::SeqCst) {
-                if let Some((path, focus)) = ready_for_page_load.pending.lock().unwrap().take() {
+                if let Some((path, focus)) = pending.take() {
+                    drop(pending);
                     navigate_to_incident(webview.app_handle(), &path, focus);
                 }
             }
