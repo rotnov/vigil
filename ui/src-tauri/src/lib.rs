@@ -3,9 +3,11 @@ mod vigil_cli;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Listener, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_notification::NotificationExt;
 
@@ -17,7 +19,7 @@ fn greet(name: &str) -> String {
 
 #[tauri::command]
 fn investigate(alert_key: String, incidents_dir: String) -> Result<(), String> {
-    let args = crate::vigil_cli::build_investigate_args("vigil", &alert_key, &incidents_dir);
+    let args = crate::vigil_cli::build_investigate_args(&vigil_bin(), &alert_key, &incidents_dir, agent_dir().as_deref());
     let output = std::process::Command::new(&args[0])
         .args(&args[1..])
         .output()
@@ -31,7 +33,7 @@ fn investigate(alert_key: String, incidents_dir: String) -> Result<(), String> {
 
 #[tauri::command]
 fn read_incident_json(incidents_dir: String, path: String) -> Result<serde_json::Value, String> {
-    let args = crate::vigil_cli::build_show_json_args("vigil", &incidents_dir, &path);
+    let args = crate::vigil_cli::build_show_json_args(&vigil_bin(), &incidents_dir, &path);
     let output = std::process::Command::new(&args[0])
         .args(&args[1..])
         .output()
@@ -54,7 +56,7 @@ fn run_fix(path: String, approvals: Vec<bool>) -> Result<String, String> {
     use std::io::Write;
     use std::process::Stdio;
 
-    let args = crate::vigil_cli::build_fix_args("vigil", &path);
+    let args = crate::vigil_cli::build_fix_args(&vigil_bin(), &path, agent_dir().as_deref());
     let mut child = std::process::Command::new(&args[0])
         .args(&args[1..])
         .stdin(Stdio::piped())
@@ -76,6 +78,52 @@ fn run_fix(path: String, approvals: Vec<bool>) -> Result<String, String> {
     }
 }
 
+/// The `vigil` binary to shell out to. Defaults to the bare name (resolved
+/// via `$PATH`, today's pre-existing behavior for anyone who hasn't set
+/// this) -- `VIGIL_BIN` overrides it with an absolute path, which real
+/// deployment (Task 11's LaunchAgent) always sets, since a launchd agent's
+/// `$PATH` is minimal and cannot be relied on to contain a dev-built
+/// `target/release/vigil`.
+fn vigil_bin() -> String {
+    std::env::var("VIGIL_BIN").unwrap_or_else(|_| "vigil".to_string())
+}
+
+/// The main `vigil` crate's sibling `agent/` Python project, passed to
+/// `vigil investigate`/`vigil fix` as `--agent-dir` so they don't fall back
+/// to their own relative-to-cwd default (which never resolves correctly
+/// from `vigil-ui`'s actual runtime cwd -- see this task's own commit
+/// message for the bug this fixes). `None` when unset: `vigil_cli`'s
+/// builders simply omit `--agent-dir` in that case, reproducing today's
+/// already-broken default rather than guessing a path that could be wrong
+/// in a different, silent way (e.g. a compile-time-baked path pointing at
+/// a since-removed worktree).
+fn agent_dir() -> Option<String> {
+    std::env::var("VIGIL_AGENT_DIR").ok()
+}
+
+/// Tracks whether the "main" webview has finished its first page load yet.
+/// `open_incident_window` is called from four places (the poller, the
+/// single-instance callback, and both deep-link paths) any of which can
+/// fire before that first load completes -- most realistically the
+/// poller, whose background thread starts concurrently with `.setup()`
+/// returning, with no ordering guarantee against the webview's own load.
+/// Before this existed, a navigation attempted in that window silently
+/// no-op'd or got clobbered by the page's own in-flight initial load,
+/// permanently losing that incident (the poller had already marked it
+/// `seen`). Now: a too-early navigation is queued in `pending` instead,
+/// and applied once a one-time `tauri://load` listener (registered in
+/// `run()`'s `.setup()`) observes the load actually completing.
+struct WindowReady {
+    ready: AtomicBool,
+    pending: Mutex<Option<(String, bool)>>,
+}
+
+impl WindowReady {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { ready: AtomicBool::new(false), pending: Mutex::new(None) })
+    }
+}
+
 /// Prepares the "main" window's content for `path` (an incident file path)
 /// and brings it forward. Called from both triggers this task wires up:
 /// the deep-link handoff (Step 4, `vigil://incident/<path>` from the
@@ -93,7 +141,23 @@ fn run_fix(path: String, approvals: Vec<bool>) -> Result<String, String> {
 /// or routed through single-instance) is something the user just actively
 /// triggered by clicking a menu-bar item or notification, so focusing is
 /// the expected outcome there.
-fn open_incident_window(app: &AppHandle, path: &str, focus: bool) {
+fn open_incident_window(app: &AppHandle, ready: &WindowReady, path: &str, focus: bool) {
+    if ready.ready.load(Ordering::SeqCst) {
+        navigate_to_incident(app, path, focus);
+    } else {
+        // Too early -- the webview hasn't finished its first load yet.
+        // Queue it; the `tauri://load` listener registered in `run()`
+        // applies whatever's queued the moment it fires. A second queued
+        // path before the first one is ever applied simply overwrites the
+        // first (last-wins) -- in practice this only matters for the
+        // poller's very first few ticks before the window has loaded even
+        // once, a narrow window where at most one real incident is likely
+        // to land.
+        *ready.pending.lock().unwrap() = Some((path.to_string(), focus));
+    }
+}
+
+fn navigate_to_incident(app: &AppHandle, path: &str, focus: bool) {
     let url = format!("index.html?path={}", urlencoding::encode(path));
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.eval(&format!("window.location.replace('{url}')"));
@@ -193,7 +257,7 @@ const STARTUP_GRACE: Duration = Duration::from_secs(300);
 /// (stub vs. not) -- inserting any earlier would permanently drop an
 /// incident this poller happened to catch mid-write, since `vigil watch`'s
 /// stub write is not guaranteed atomic from this reader's point of view.
-fn spawn_incident_poller(app: AppHandle) {
+fn spawn_incident_poller(app: AppHandle, ready: Arc<WindowReady>) {
     let poller_started_at = std::time::SystemTime::now();
     std::thread::spawn(move || {
         let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -221,7 +285,7 @@ fn spawn_incident_poller(app: AppHandle) {
                 }
 
                 let path_str = path.to_string_lossy().to_string();
-                open_incident_window(&app, &path_str, false);
+                open_incident_window(&app, &ready, &path_str, false);
 
                 let body = extract_rule_message(&content).unwrap_or("New incident detected.");
                 app.notification()
@@ -248,14 +312,29 @@ pub fn run() {
         // second process ever fully starting; route it the same place a
         // `vigil://` deep link goes (Step 4) when one is present, or just
         // surface the existing window otherwise.
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if let Some(path) = args.iter().find_map(|a| parse_incident_url(a)) {
-                open_incident_window(app, &path, true);
-            } else if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-        }))
+        .plugin({
+            // This callback fires on a *second launch attempt while
+            // already running*, meaning the window from the *first*
+            // launch has necessarily already finished loading by then in
+            // any realistic scenario. It cannot capture the `ready` state
+            // `.setup()` constructs below -- plugin registration happens
+            // before `.setup()` runs, and that `ready` doesn't exist yet
+            // at this point in the builder chain. Give it its own,
+            // independently-constructed `WindowReady`, pre-marked ready
+            // (never flipped `false->true` like the shared one) so this
+            // call site always navigates immediately, matching its actual
+            // real-world timing.
+            let ready = WindowReady::new();
+            ready.ready.store(true, Ordering::SeqCst);
+            tauri_plugin_single_instance::init(move |app, args, _cwd| {
+                if let Some(path) = args.iter().find_map(|a| parse_incident_url(a)) {
+                    open_incident_window(app, &ready, &path, true);
+                } else if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            })
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
@@ -272,23 +351,36 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             let _ = app.handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            let ready = WindowReady::new();
+            if let Some(window) = app.get_webview_window("main") {
+                let ready_for_load = ready.clone();
+                let handle_for_load = app.handle().clone();
+                window.once("tauri://load", move |_event| {
+                    ready_for_load.ready.store(true, Ordering::SeqCst);
+                    if let Some((path, focus)) = ready_for_load.pending.lock().unwrap().take() {
+                        navigate_to_incident(&handle_for_load, &path, focus);
+                    }
+                });
+            }
+
             let handle = app.handle().clone();
             // Cold start: the app was launched *by* a `vigil://` URL.
             if let Ok(Some(urls)) = app.deep_link().get_current() {
                 if let Some(path) = urls.first().and_then(|u| parse_incident_url(&u.to_string())) {
-                    open_incident_window(&handle, &path, true);
+                    open_incident_window(&handle, &ready, &path, true);
                 }
             }
             // Already running: single-instance (above) routes the second
             // invocation's URL here instead of spawning a second process.
             let handle = app.handle().clone();
+            let ready_for_deep_link = ready.clone();
             app.deep_link().on_open_url(move |event| {
                 if let Some(path) = event.urls().first().and_then(|u| parse_incident_url(&u.to_string())) {
-                    open_incident_window(&handle, &path, true);
+                    open_incident_window(&handle, &ready_for_deep_link, &path, true);
                 }
             });
 
-            spawn_incident_poller(app.handle().clone());
+            spawn_incident_poller(app.handle().clone(), ready.clone());
 
             Ok(())
         })

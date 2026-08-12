@@ -4,15 +4,29 @@
 //! anything, the same split `vigil`'s own `agent.rs`/`agent_process.rs`
 //! already use.
 
-/// Argv for `vigil investigate <alert_key> --incidents-dir <incidents_dir>`.
-pub fn build_investigate_args(vigil_bin: &str, alert_key: &str, incidents_dir: &str) -> Vec<String> {
-    vec![
+/// Argv for `vigil investigate <alert_key> --incidents-dir <incidents_dir>`,
+/// optionally with `--agent-dir <agent_dir>` appended when the caller
+/// resolved one (see `lib.rs::agent_dir` -- `vigil-ui`'s real runtime cwd is
+/// never the main crate's repo root, so `vigil investigate`'s own
+/// relative-to-cwd `--agent-dir` default never resolves correctly there).
+pub fn build_investigate_args(
+    vigil_bin: &str,
+    alert_key: &str,
+    incidents_dir: &str,
+    agent_dir: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
         vigil_bin.to_string(),
         "investigate".to_string(),
         alert_key.to_string(),
         "--incidents-dir".to_string(),
         incidents_dir.to_string(),
-    ]
+    ];
+    if let Some(dir) = agent_dir {
+        args.push("--agent-dir".to_string());
+        args.push(dir.to_string());
+    }
+    args
 }
 
 /// Argv for `vigil incidents --dir <incidents_dir> --show <path> --json`.
@@ -43,9 +57,15 @@ pub fn build_show_json_args(vigil_bin: &str, incidents_dir: &str, path: &str) ->
     ]
 }
 
-/// Argv for `vigil fix <path>`.
-pub fn build_fix_args(vigil_bin: &str, path: &str) -> Vec<String> {
-    vec![vigil_bin.to_string(), "fix".to_string(), path.to_string()]
+/// Argv for `vigil fix <path>`, optionally with `--agent-dir <agent_dir>`
+/// appended -- same reasoning as `build_investigate_args`'s `agent_dir`.
+pub fn build_fix_args(vigil_bin: &str, path: &str, agent_dir: Option<&str>) -> Vec<String> {
+    let mut args = vec![vigil_bin.to_string(), "fix".to_string(), path.to_string()];
+    if let Some(dir) = agent_dir {
+        args.push("--agent-dir".to_string());
+        args.push(dir.to_string());
+    }
+    args
 }
 
 /// The full stdin `vigil fix`'s interactive per-step prompt loop expects:
@@ -65,8 +85,25 @@ mod tests {
 
     #[test]
     fn build_investigate_args_has_the_alert_key_and_incidents_dir() {
-        let args = build_investigate_args("/usr/local/bin/vigil", "cpu_hog:1", "/tmp/incidents");
+        let args = build_investigate_args("/usr/local/bin/vigil", "cpu_hog:1", "/tmp/incidents", None);
         assert_eq!(args, vec!["/usr/local/bin/vigil", "investigate", "cpu_hog:1", "--incidents-dir", "/tmp/incidents"]);
+    }
+
+    #[test]
+    fn build_investigate_args_appends_agent_dir_when_given() {
+        let args = build_investigate_args("/usr/local/bin/vigil", "cpu_hog:1", "/tmp/incidents", Some("/repo/agent"));
+        assert_eq!(
+            args,
+            vec![
+                "/usr/local/bin/vigil",
+                "investigate",
+                "cpu_hog:1",
+                "--incidents-dir",
+                "/tmp/incidents",
+                "--agent-dir",
+                "/repo/agent",
+            ]
+        );
     }
 
     #[test]
@@ -110,8 +147,14 @@ mod tests {
 
     #[test]
     fn build_fix_args_has_the_incident_path() {
-        let args = build_fix_args("vigil", "/tmp/incidents/x.md");
+        let args = build_fix_args("vigil", "/tmp/incidents/x.md", None);
         assert_eq!(args, vec!["vigil", "fix", "/tmp/incidents/x.md"]);
+    }
+
+    #[test]
+    fn build_fix_args_appends_agent_dir_when_given() {
+        let args = build_fix_args("vigil", "/tmp/incidents/x.md", Some("/repo/agent"));
+        assert_eq!(args, vec!["vigil", "fix", "/tmp/incidents/x.md", "--agent-dir", "/repo/agent"]);
     }
 
     #[test]
