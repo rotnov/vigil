@@ -1,4 +1,5 @@
 mod process_tree;
+mod vigil_cli;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
