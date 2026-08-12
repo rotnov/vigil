@@ -66,16 +66,16 @@ pub fn run(dir: &str, show: Option<&str>, limit: usize, json: bool) -> i32 {
             [single] => match std::fs::read_to_string(single) {
                 Ok(content) => {
                     if json {
-                        match serde_json::to_string(&build_incident_json(&content)) {
-                            Ok(j) => {
-                                println!("{j}");
-                                0
-                            }
-                            Err(e) => {
-                                eprintln!("[vigil] failed to serialize {}: {e}", single.display());
-                                1
-                            }
-                        }
+                        // No real error path to test or report here (see
+                        // AGENTS.md's testing section on preferring
+                        // simplification over exempting unreachable
+                        // branches): every `IncidentJson` field is a
+                        // `&str`/`Option<&str>`/derived enum built by
+                        // `build_incident_json` — no floats, no non-string
+                        // map keys, no custom `Serialize` impl — so
+                        // `serde_json::to_string` on it cannot fail.
+                        println!("{}", serde_json::to_string(&build_incident_json(&content)).unwrap());
+                        0
                     } else {
                         print!("{content}");
                         0

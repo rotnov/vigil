@@ -559,6 +559,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_alert_key_is_none_when_the_field_is_not_wrapped_in_backticks() {
+        // Malformed/hand-edited stub: no backticks around the key at all,
+        // so `strip_prefix('`')` fails and the `?` inside `and_then` short
+        // -circuits to `None` rather than returning the raw text.
+        let content = "# t\n\n**Alert key:** cpu_hog:1\n\n**Rule message:** m\n";
+        assert_eq!(extract_alert_key(content), None);
+    }
+
+    #[test]
     fn extract_diagnosis_reads_up_to_end_of_file_when_there_is_no_proposed_fix() {
         let content = "# t\n\n**Rule message:** m\n\n## Agent diagnosis\n\nThe culprit is pycharm.\n";
         assert_eq!(extract_diagnosis(content), Some("The culprit is pycharm."));
@@ -585,6 +594,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_diagnosis_is_none_when_the_heading_is_present_but_body_is_empty() {
+        // The heading exists but is immediately followed by the next
+        // section with nothing in between (after trimming) — treated the
+        // same as "no diagnosis yet", not an empty-but-present diagnosis.
+        let content = "# t\n\n## Agent diagnosis\n\n## Proposed fix\n\n```json\n{}\n```\n";
+        assert_eq!(extract_diagnosis(content), None);
+    }
+
+    #[test]
     fn extract_fix_execution_reads_to_end_of_file() {
         let content = "# t\n\n## Fix execution\n\n_Approved: 2026-08-09 02:30 (steps 1 of 1)_\n\n1. done\n";
         let report = extract_fix_execution(content).unwrap();
@@ -595,6 +613,14 @@ mod tests {
     #[test]
     fn extract_fix_execution_is_none_when_the_heading_is_absent() {
         assert_eq!(extract_fix_execution("# t\n\nno fix execution here\n"), None);
+    }
+
+    #[test]
+    fn extract_fix_execution_is_none_when_the_heading_is_present_but_body_is_empty() {
+        // The heading exists but nothing (or only whitespace) follows it —
+        // e.g. a fix run that produced no journal text.
+        let content = "# t\n\n## Fix execution\n\n";
+        assert_eq!(extract_fix_execution(content), None);
     }
 
     #[test]
