@@ -22,7 +22,13 @@ function getIncidentsDir(path) {
 
 async function loadIncident(path) {
   const incidentsDir = getIncidentsDir(path);
-  let incident = await invoke("read_incident_json", { incidentsDir, path });
+  let incident;
+  try {
+    incident = await invoke("read_incident_json", { incidentsDir, path });
+  } catch (err) {
+    showError(`Failed to read incident: ${err}`);
+    return;
+  }
 
   if (!incident.diagnosis) {
     setThinking(true);
@@ -41,8 +47,22 @@ async function loadIncident(path) {
   renderDiagnosis(incident);
 
   if (incident.alert_key) {
-    const tree = await invoke("process_tree", { alertKey: incident.alert_key });
-    renderProcessTree(tree);
+    try {
+      const tree = await invoke("process_tree", { alertKey: incident.alert_key });
+      renderProcessTree(tree);
+    } catch (err) {
+      // Deliberately NOT `showError(...)` here -- by this point
+      // `renderDiagnosis` has already written the real diagnosis into
+      // `#diagnosis-body`, and `showError` targets that same element, so
+      // reusing it here would silently replace correct, already-visible
+      // diagnosis text with an unrelated process-tree error. The card
+      // stays visible with an inline error in its own section instead, so
+      // a process-tree failure surfaces without destroying content the
+      // user already has.
+      const card = document.getElementById("process-tree-card");
+      card.style.display = "";
+      document.getElementById("tree-container").textContent = `Failed to load process tree: ${err}`;
+    }
   } else {
     document.getElementById("process-tree-card").style.display = "none";
   }
