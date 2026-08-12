@@ -2,42 +2,854 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
-    <script type="module" src="/src/main.ts" defer></script>
+    <title>vigil — Investigate</title>
+    <style>
+      :root {
+        --ground: #12151c;
+        --surface: #191d26;
+        --surface-2: #212635;
+        --surface-3: #262c3d;
+        --border: #2b3143;
+        --border-soft: #232838;
+        --ink: #eef0f4;
+        --ink-dim: #8991a3;
+        --ink-faint: #5b6274;
+        --accent: #d98f4a;
+        --accent-dim: #9c6a3a;
+        --accent-ink: #1a1206;
+        --critical: #e8553f;
+        --critical-soft: rgba(232, 85, 63, 0.14);
+        --warning: #e0a935;
+        --warning-soft: rgba(224, 169, 53, 0.14);
+        --ok: #5fae7c;
+        --ok-soft: rgba(95, 174, 124, 0.14);
+        --zombie: #a586c9;
+        --zombie-soft: rgba(165, 134, 201, 0.16);
+        --shadow: 0 20px 48px -20px rgba(0, 0, 0, 0.6);
+      }
+
+      :root[data-theme="light"],
+      :root {
+        color-scheme: dark;
+      }
+
+      @media (prefers-color-scheme: light) {
+        :root {
+          --ground: #eef0f4;
+          --surface: #ffffff;
+          --surface-2: #f5f6f9;
+          --surface-3: #ebedf3;
+          --border: #dde1ea;
+          --border-soft: #e6e9f0;
+          --ink: #171a22;
+          --ink-dim: #565e70;
+          --ink-faint: #9aa1b0;
+          --accent: #b8712f;
+          --accent-dim: #d99a58;
+          --accent-ink: #fff8f0;
+          --critical: #c73f2c;
+          --critical-soft: rgba(199, 63, 44, 0.09);
+          --warning: #a97819;
+          --warning-soft: rgba(169, 120, 25, 0.1);
+          --ok: #3f8f5d;
+          --ok-soft: rgba(63, 143, 93, 0.1);
+          --zombie: #7c5a99;
+          --zombie-soft: rgba(124, 90, 153, 0.09);
+          --shadow: 0 20px 48px -24px rgba(23, 26, 34, 0.22);
+          color-scheme: light;
+        }
+      }
+
+      :root[data-theme="dark"] {
+        --ground: #12151c;
+        --surface: #191d26;
+        --surface-2: #212635;
+        --surface-3: #262c3d;
+        --border: #2b3143;
+        --border-soft: #232838;
+        --ink: #eef0f4;
+        --ink-dim: #8991a3;
+        --ink-faint: #5b6274;
+        --accent: #d98f4a;
+        --accent-dim: #9c6a3a;
+        --accent-ink: #1a1206;
+        --critical: #e8553f;
+        --critical-soft: rgba(232, 85, 63, 0.14);
+        --warning: #e0a935;
+        --warning-soft: rgba(224, 169, 53, 0.14);
+        --ok: #5fae7c;
+        --ok-soft: rgba(95, 174, 124, 0.14);
+        --zombie: #a586c9;
+        --zombie-soft: rgba(165, 134, 201, 0.16);
+        --shadow: 0 20px 48px -20px rgba(0, 0, 0, 0.6);
+        color-scheme: dark;
+      }
+
+      :root[data-theme="light"] {
+        --ground: #eef0f4;
+        --surface: #ffffff;
+        --surface-2: #f5f6f9;
+        --surface-3: #ebedf3;
+        --border: #dde1ea;
+        --border-soft: #e6e9f0;
+        --ink: #171a22;
+        --ink-dim: #565e70;
+        --ink-faint: #9aa1b0;
+        --accent: #b8712f;
+        --accent-dim: #d99a58;
+        --accent-ink: #fff8f0;
+        --critical: #c73f2c;
+        --critical-soft: rgba(199, 63, 44, 0.09);
+        --warning: #a97819;
+        --warning-soft: rgba(169, 120, 25, 0.1);
+        --ok: #3f8f5d;
+        --ok-soft: rgba(63, 143, 93, 0.1);
+        --zombie: #7c5a99;
+        --zombie-soft: rgba(124, 90, 153, 0.09);
+        --shadow: 0 20px 48px -24px rgba(23, 26, 34, 0.22);
+        color-scheme: light;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--ground);
+        color: var(--ink);
+        font-family: -apple-system, "SF Pro Text", "Segoe UI", Helvetica, Arial, sans-serif;
+        font-size: 14px;
+        line-height: 1.55;
+        padding: 48px 20px 96px;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .page {
+        max-width: 760px;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 22px;
+      }
+
+      .display {
+        font-family: -apple-system, "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif;
+        font-weight: 690;
+        letter-spacing: -0.015em;
+        text-wrap: balance;
+      }
+
+      .mono {
+        font-family: ui-monospace, "SF Mono", "Menlo", "Cascadia Code", monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .eyebrow {
+        font-size: 11px;
+        font-weight: 650;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+      }
+
+      /* ---------- masthead ---------- */
+
+      .masthead {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .mark {
+        width: 22px;
+        height: 22px;
+        flex: none;
+      }
+
+      .mark circle.iris {
+        fill: none;
+        stroke: var(--accent);
+        stroke-width: 1.6;
+      }
+
+      .mark circle.pupil {
+        fill: var(--accent);
+      }
+
+      .masthead .word {
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+
+      .masthead .sep {
+        color: var(--ink-faint);
+      }
+
+      .masthead .crumb {
+        color: var(--ink-dim);
+        font-size: 13px;
+      }
+
+      /* ---------- notification inset ---------- */
+
+      .origin {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .notif {
+        flex: none;
+        width: 320px;
+        background: var(--surface-2);
+        border: 1px solid var(--border-soft);
+        border-radius: 13px;
+        padding: 11px 13px;
+        box-shadow: var(--shadow);
+      }
+
+      .notif-head {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-bottom: 5px;
+      }
+
+      .notif-head .mark { width: 14px; height: 14px; }
+
+      .notif-app {
+        font-size: 11px;
+        font-weight: 650;
+        color: var(--ink-dim);
+        letter-spacing: 0.01em;
+      }
+
+      .notif-time {
+        margin-left: auto;
+        font-size: 11px;
+        color: var(--ink-faint);
+      }
+
+      .notif-title {
+        font-size: 13px;
+        font-weight: 650;
+        margin-bottom: 2px;
+      }
+
+      .notif-body {
+        font-size: 12.5px;
+        color: var(--ink-dim);
+        line-height: 1.4;
+      }
+
+      .notif-body .cmd {
+        color: var(--accent);
+      }
+
+      .origin-arrow {
+        flex: none;
+        color: var(--ink-faint);
+        font-size: 20px;
+      }
+
+      .origin-note {
+        font-size: 12.5px;
+        color: var(--ink-faint);
+      }
+
+      .origin-note strong {
+        color: var(--ink-dim);
+        font-weight: 600;
+      }
+
+      /* ---------- vitals ---------- */
+
+      .vitals {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        background: var(--border);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        overflow: hidden;
+      }
+
+      .vital {
+        background: var(--surface);
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .vital-label {
+        font-size: 10.5px;
+        font-weight: 650;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+      }
+
+      .vital-value {
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+
+      .vital-value .unit {
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--ink-dim);
+        margin-left: 2px;
+      }
+
+      .vital-bar {
+        height: 3px;
+        border-radius: 2px;
+        background: var(--surface-3);
+        overflow: hidden;
+      }
+
+      .vital-bar > span {
+        display: block;
+        height: 100%;
+        border-radius: 2px;
+      }
+
+      .vital.crit .vital-value { color: var(--critical); }
+      .vital.crit .vital-bar > span { background: var(--critical); }
+      .vital.warn .vital-value { color: var(--warning); }
+      .vital.warn .vital-bar > span { background: var(--warning); }
+      .vital.ok .vital-bar > span { background: var(--ok); }
+
+      /* ---------- section shell ---------- */
+
+      section.card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        overflow: hidden;
+      }
+
+      .card-head {
+        padding: 16px 18px 0;
+      }
+
+      .card-head .eyebrow {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+      }
+
+      .card-title {
+        font-size: 16px;
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .alert-key {
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--ink-faint);
+        background: var(--surface-2);
+        border: 1px solid var(--border-soft);
+        padding: 2px 7px;
+        border-radius: 5px;
+      }
+
+      /* ---------- diagnosis ---------- */
+
+      .diagnosis-body {
+        padding: 12px 18px 18px;
+        color: var(--ink-dim);
+        max-width: 66ch;
+        white-space: pre-wrap;
+      }
+
+      .diagnosis-body p { margin: 0 0 10px; }
+      .diagnosis-body p:last-child { margin-bottom: 0; }
+
+      .diagnosis-body strong { color: var(--ink); font-weight: 620; }
+
+      .findings {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 14px;
+      }
+
+      .finding {
+        display: grid;
+        grid-template-columns: 20px 1fr;
+        gap: 10px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: var(--surface-2);
+        border: 1px solid var(--border-soft);
+      }
+
+      .finding .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-top: 5px;
+      }
+
+      .finding.leak .dot { background: var(--critical); }
+      .finding.idle .dot { background: var(--zombie); }
+
+      .finding-text { color: var(--ink); font-size: 13px; }
+      .finding-text .sub { color: var(--ink-dim); font-size: 12.5px; }
+
+      /* ---------- process tree ---------- */
+
+      .tree-head {
+        display: grid;
+        grid-template-columns: 1fr 108px 92px 64px 68px 84px;
+        gap: 8px;
+        padding: 12px 18px 8px;
+        font-size: 10.5px;
+        font-weight: 650;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+        border-bottom: 1px solid var(--border-soft);
+      }
+
+      .tree-head span:not(:first-child) { text-align: right; }
+
+      .group {
+        border-top: 1px solid var(--border-soft);
+      }
+
+      .group:first-of-type { border-top: none; }
+
+      .group-row {
+        display: grid;
+        grid-template-columns: 1fr 108px 92px 64px 68px 84px;
+        gap: 8px;
+        align-items: center;
+        padding: 11px 18px;
+        background: var(--surface-2);
+      }
+
+      .group-row .proc-name {
+        font-size: 13px;
+        font-weight: 620;
+      }
+
+      .group-row .proc-sub {
+        font-size: 11.5px;
+        color: var(--ink-dim);
+        font-weight: 400;
+        margin-top: 1px;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 108px 92px 64px 68px 84px;
+        gap: 8px;
+        align-items: center;
+        padding: 9px 18px 9px 18px;
+        border-top: 1px solid var(--border-soft);
+        transition: background 0.12s ease;
+      }
+
+      .row:first-child { border-top: none; }
+
+      .row:hover { background: var(--surface-2); }
+
+      .row .proc-cell {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding-left: 22px;
+        position: relative;
+      }
+
+      .row .proc-cell::before {
+        content: "";
+        position: absolute;
+        left: 6px;
+        top: 0;
+        bottom: 50%;
+        width: 9px;
+        border-left: 1px solid var(--border);
+        border-bottom: 1px solid var(--border);
+        border-bottom-left-radius: 4px;
+      }
+
+      .row:last-child .proc-cell::after {
+        content: "";
+        position: absolute;
+        left: 6px;
+        top: 50%;
+        bottom: -11px;
+        border-left: 1px solid transparent;
+      }
+
+      .proc-name-sm {
+        font-size: 12.5px;
+        color: var(--ink);
+      }
+
+      .pid {
+        color: var(--ink-dim);
+        font-size: 12px;
+        text-align: right;
+      }
+
+      .parent {
+        color: var(--ink-faint);
+        font-size: 12px;
+        text-align: right;
+      }
+
+      .cpu, .ram {
+        text-align: right;
+        font-size: 12px;
+        color: var(--ink-dim);
+      }
+
+      .age {
+        text-align: right;
+        font-size: 12px;
+        color: var(--ink-dim);
+      }
+
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 10.5px;
+        font-weight: 650;
+        letter-spacing: 0.02em;
+        padding: 3px 8px;
+        border-radius: 20px;
+        white-space: nowrap;
+      }
+
+      .chip.idle { background: var(--zombie-soft); color: var(--zombie); }
+      .chip.leak { background: var(--critical-soft); color: var(--critical); }
+      .chip.orphan { background: var(--warning-soft); color: var(--warning); }
+
+      .gen-fold {
+        padding: 9px 18px;
+        border-top: 1px solid var(--border-soft);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .gen-fold:hover { color: var(--ink-dim); }
+
+      .gen-fold svg {
+        width: 11px;
+        height: 11px;
+        transition: transform 0.15s ease;
+      }
+
+      .gen-fold.open svg { transform: rotate(90deg); }
+
+      .gen-count {
+        margin-left: auto;
+        font-size: 11px;
+      }
+
+      .hidden-gens { display: none; }
+      .hidden-gens.show { display: block; }
+
+      /* ---------- fix card ---------- */
+
+      .fix-card {
+        border-color: var(--accent-dim);
+      }
+
+      .fix-head {
+        padding: 16px 18px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        border-bottom: 1px solid var(--border-soft);
+      }
+
+      .fix-badge {
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: var(--accent-ink);
+        background: var(--accent);
+        padding: 4px 9px;
+        border-radius: 6px;
+      }
+
+      .fix-step-label {
+        font-size: 12px;
+        color: var(--ink-faint);
+      }
+
+      .fix-body {
+        padding: 16px 18px 18px;
+      }
+
+      .fix-step + .fix-step {
+        margin-top: 20px;
+        padding-top: 20px;
+        border-top: 1px solid var(--border-soft);
+      }
+
+      .fix-category {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        font-weight: 650;
+        color: var(--ink-dim);
+        background: var(--surface-2);
+        border: 1px solid var(--border-soft);
+        padding: 3px 9px;
+        border-radius: 6px;
+        margin-bottom: 10px;
+      }
+
+      .fix-category .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--critical); }
+
+      .fix-desc {
+        font-size: 13.5px;
+        color: var(--ink);
+        max-width: 62ch;
+        margin: 0 0 12px;
+      }
+
+      .fix-target {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        font-size: 12px;
+        color: var(--ink-dim);
+        margin-bottom: 16px;
+      }
+
+      .fix-target .k { color: var(--ink-faint); }
+      .fix-target .v { color: var(--ink); }
+
+      .fix-verify {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+        font-size: 12px;
+        color: var(--ink-faint);
+        background: var(--surface-2);
+        border: 1px dashed var(--border);
+        border-radius: 8px;
+        padding: 9px 11px;
+        margin-bottom: 18px;
+      }
+
+      .fix-verify svg { flex: none; margin-top: 1px; color: var(--ink-faint); }
+
+      .fix-actions {
+        display: flex;
+        gap: 10px;
+      }
+
+      button.act {
+        font: inherit;
+        font-weight: 650;
+        font-size: 13px;
+        border-radius: 8px;
+        padding: 10px 18px;
+        border: 1px solid transparent;
+        cursor: pointer;
+        transition: transform 0.08s ease, filter 0.12s ease, background 0.12s ease, opacity 0.15s ease;
+      }
+
+      button.act:active { transform: translateY(1px); }
+
+      button.approve {
+        background: var(--critical);
+        color: #fff9f7;
+      }
+      button.approve:hover { filter: brightness(1.07); }
+
+      button.reject {
+        background: transparent;
+        color: var(--ink-dim);
+        border-color: var(--border);
+      }
+      button.reject:hover { background: var(--surface-2); color: var(--ink); }
+
+      button.act:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      .fix-result {
+        display: none;
+        align-items: center;
+        gap: 9px;
+        padding: 12px 14px;
+        border-radius: 8px;
+        font-size: 13px;
+        margin-top: 4px;
+      }
+
+      .fix-result.show { display: flex; }
+
+      .fix-result.is-approve {
+        background: var(--critical-soft);
+        color: var(--critical);
+      }
+
+      .fix-result.is-reject {
+        background: var(--surface-2);
+        color: var(--ink-dim);
+      }
+
+      .fix-result svg { flex: none; }
+
+      /* ---------- footer note ---------- */
+
+      .foot-note {
+        text-align: center;
+        font-size: 11.5px;
+        color: var(--ink-faint);
+        padding-top: 6px;
+      }
+
+      @media (max-width: 620px) {
+        .origin { flex-direction: column; align-items: flex-start; }
+        .notif { width: 100%; }
+        .vitals { grid-template-columns: repeat(2, 1fr); }
+        .tree-head, .row, .group-row { grid-template-columns: 1fr 78px 56px 56px; }
+        .tree-head span:nth-child(3), .row .cpu, .group-row .cpu { display: none; }
+      }
+    </style>
   </head>
-
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
+    <div class="page">
 
-      <div class="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/src/assets/vite.svg" class="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img
-            src="/src/assets/tauri.svg"
-            class="logo tauri"
-            alt="Tauri logo"
-          />
-        </a>
-        <a href="https://www.typescriptlang.org/docs" target="_blank">
-          <img
-            src="/src/assets/typescript.svg"
-            class="logo typescript"
-            alt="typescript logo"
-          />
-        </a>
+      <div class="masthead">
+        <svg class="mark" viewBox="0 0 24 24">
+          <circle class="iris" cx="12" cy="12" r="8.5"></circle>
+          <circle class="pupil" cx="12" cy="12" r="2.6"></circle>
+        </svg>
+        <span class="word display">vigil</span>
+        <span class="sep">/</span>
+        <span class="crumb">Investigate</span>
       </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-    </main>
+      <div class="origin">
+        <div class="notif">
+          <div class="notif-head">
+            <svg class="mark" viewBox="0 0 24 24">
+              <circle class="iris" cx="12" cy="12" r="8.5"></circle>
+              <circle class="pupil" cx="12" cy="12" r="2.6"></circle>
+            </svg>
+            <span class="notif-app">vigil</span>
+            <span class="notif-time">now</span>
+          </div>
+          <div class="notif-title" id="notif-title"></div>
+          <div class="notif-body" id="notif-body"></div>
+        </div>
+        <div class="origin-arrow">→</div>
+        <div class="origin-note">Investigation runs automatically when this window opens — no extra steps.</div>
+      </div>
+
+      <div class="vitals">
+        <div class="vital" id="vital-swap">
+          <span class="vital-label">Swap</span>
+          <span class="vital-value mono" id="vital-swap-value">—</span>
+          <span class="vital-bar"><span id="vital-swap-bar" style="width: 0%"></span></span>
+        </div>
+        <div class="vital" id="vital-freeram">
+          <span class="vital-label">Free RAM</span>
+          <span class="vital-value mono" id="vital-freeram-value">—</span>
+          <span class="vital-bar"><span id="vital-freeram-bar" style="width: 0%"></span></span>
+        </div>
+        <div class="vital" id="vital-loadavg">
+          <span class="vital-label">Load avg</span>
+          <span class="vital-value mono" id="vital-loadavg-value">—</span>
+          <span class="vital-bar"><span id="vital-loadavg-bar" style="width: 0%"></span></span>
+        </div>
+        <div class="vital" id="vital-flagged">
+          <span class="vital-label">Flagged group</span>
+          <span class="vital-value mono" id="vital-flagged-value">—</span>
+          <span class="vital-bar"><span id="vital-flagged-bar" style="width: 0%"></span></span>
+        </div>
+      </div>
+
+      <section class="card">
+        <div class="card-head">
+          <div class="eyebrow">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 8v5M12 16.2v.1"/><circle cx="12" cy="12" r="9.5"/></svg>
+            Agent diagnosis
+          </div>
+          <div class="card-title">
+            <span class="display" id="diagnosis-title"></span>
+            <span class="alert-key mono" id="alert-key-badge"></span>
+          </div>
+        </div>
+        <div class="diagnosis-body" id="diagnosis-body"></div>
+      </section>
+
+      <section class="card" id="process-tree-card">
+        <div class="card-head" style="padding-bottom: 12px;">
+          <div class="eyebrow">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 4v16h16M4 12h6M4 6h10M4 18h4"/></svg>
+            <span id="tree-eyebrow">Process tree</span>
+          </div>
+          <div class="card-title" style="font-size: 14px;">Only what's involved in this incident</div>
+        </div>
+
+        <div class="tree-head">
+          <span>Process</span>
+          <span>Parent</span>
+          <span>Status</span>
+          <span>Age</span>
+          <span>CPU</span>
+          <span>RSS</span>
+        </div>
+
+        <div id="tree-container"></div>
+      </section>
+
+      <section class="card fix-card" id="fix-card" style="display: none;">
+        <div class="fix-head">
+          <span class="fix-badge">Proposed fix</span>
+          <span class="fix-step-label" id="fix-step-label"></span>
+        </div>
+        <div class="fix-body" id="fix-body">
+          <div class="fix-verify">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9.5"/></svg>
+            <span>vigil re-verifies each step's target still matches before acting — if it's already gone or changed, it stops and reports why instead of guessing.</span>
+          </div>
+          <div class="fix-actions" id="fix-actions">
+            <button class="act approve" type="button">Approve &amp; run</button>
+            <button class="act reject" type="button">Reject</button>
+          </div>
+          <div class="fix-result is-approve" id="result-approve">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12l5 5L20 7"/></svg>
+            <span id="result-approve-text">Approved — handing this step to the execute-agent now.</span>
+          </div>
+          <div class="fix-result is-reject" id="result-reject">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            <span id="result-reject-text">No steps approved — nothing executed.</span>
+          </div>
+        </div>
+      </section>
+
+    </div>
+
+    <script type="module" src="/src/incident.js"></script>
   </body>
 </html>
