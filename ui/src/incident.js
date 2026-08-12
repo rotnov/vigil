@@ -57,6 +57,7 @@ async function loadIncident(path, userInitiated) {
   }
 
   if (userInitiated) {
+    setOriginNote("Investigation runs automatically when this window opens — no extra steps.");
     const updated = await runInvestigation(incident, incidentsDir, path);
     if (updated) await render(updated, path);
     return;
@@ -68,6 +69,7 @@ async function loadIncident(path, userInitiated) {
   // and wait for real user attention before spending tokens. The triggers
   // are armed *before* the process-tree query is awaited, so a click or
   // focus landing during that few-hundred-millisecond query isn't lost.
+  setOriginNote("This window opened in the background — investigation starts once you bring it forward, or click Investigate now.");
   renderOrigin(incident);
   renderDiagnosis(incident);
   setDiagnosisText("New incident — nothing has been investigated yet. Bring this window forward, or start it here:");
@@ -241,6 +243,15 @@ function hideInvestigateButton() {
 // note, and any error all land here.
 function setDiagnosisText(message) {
   document.getElementById("diagnosis-body").textContent = message;
+}
+
+// The origin card's static caption ("Investigation runs automatically...")
+// is only true for a user-initiated arrival -- for the poller's deferred
+// path it must say what actually happens (wait for attention, or click the
+// button), or it directly contradicts the "Investigate now" state right
+// below it.
+function setOriginNote(message) {
+  document.getElementById("origin-note").textContent = message;
 }
 
 function setThinking(isThinking) {
