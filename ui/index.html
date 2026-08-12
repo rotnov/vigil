@@ -665,6 +665,14 @@
       }
       button.reject:hover { background: var(--surface-2); color: var(--ink); }
 
+      button.investigate {
+        background: var(--accent);
+        color: var(--accent-ink);
+      }
+      button.investigate:hover { filter: brightness(1.07); }
+
+      .investigate-now { padding: 0 18px 18px; }
+
       button.act:focus-visible {
         outline: 2px solid var(--accent);
         outline-offset: 2px;
@@ -777,6 +785,14 @@
           </div>
         </div>
         <div class="diagnosis-body" id="diagnosis-body"></div>
+        <!-- Shown only when this window was pre-loaded silently by the
+             incidents poller and no diagnosis exists yet: investigation
+             spends real agent tokens, so it never starts until a human
+             actually looks at (or clicks in) this window. See
+             `incident.js`'s `armDeferredInvestigation`. -->
+        <div class="investigate-now" id="investigate-now-wrap" style="display: none;">
+          <button class="act investigate" type="button" id="investigate-now">Investigate now</button>
+        </div>
       </section>
 
       <section class="card" id="process-tree-card">

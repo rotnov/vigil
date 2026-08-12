@@ -24,10 +24,10 @@ the machine toward or away from this, including the cost vigil itself adds.
   fix execution all live only in `agent/` (Python, Claude Agent SDK), reached via
   `src/agent_process.rs` shelling out to `uv run vigil-agent ask` / `uv run
   vigil-agent execute`.
-- Investigation is opt-in, not automatic: an alert firing notifies with the command
-  to run, `vigil investigate <alert-key>`, and — only for alert keys
+- Investigation is opt-in, not automatic: an alert firing notifies and stops there,
+  leaving `vigil investigate <alert-key>` for the user to run. Only alert keys
   `agent::is_journal_worthy` returns true for (`high_load`, `cpu_hog:*`,
-  `battery_low`, `high_process_count:*`) — also writes a stub incident file
+  `battery_low`, `high_process_count:*`) also get a stub incident file
   (`incidents::write_stub`: title, alert key, rule message, plus a `**Command:**`
   line when the alert was process-specific and captured one — nothing else); other
   keys get only the plain notification, same as before this whole plan
@@ -35,9 +35,16 @@ the machine toward or away from this, including the cost vigil itself adds.
   targetless and would fire unboundedly if journaled; `swap_pressure`/`low_memory`
   dedupe fine via `IncidentTracker` just like `high_load` does but are simply
   outside the journal-worthy set by design, left to the interactive `a` flow). No
-  agent process spawns until the user explicitly runs that command. For the
-  journal-worthy subset, that notification is now posted by `vigil-ui`, not
-  `vigil watch` itself — see "The live incident-monitoring loop" below.
+  agent process spawns until the user explicitly asks for one. For the
+  journal-worthy subset, the notification is posted by `vigil-ui`, not `vigil
+  watch` itself — see "The live incident-monitoring loop" below. `vigil-ui`
+  pre-navigates its window to the new incident *before* notifying (macOS
+  notifications carry no click payload, so the content has to be ready in
+  advance), but that silent pre-navigation must never start an investigation:
+  `incident_url`'s `auto=0`/`auto=1` bit carries "did a human ask for this
+  window", and `incident.js` only investigates on `auto=1` or on real user
+  attention afterwards (window focus, or the "Investigate now" button). A window
+  loaded in the background with nobody looking at it spends no tokens.
 - `vigil investigate` runs the same read-only investigation agent as the
   interactive `a`-key ask in `vigil ui` — identical contract either way, same
   `agent/src/vigil_agent/diagnose.py` config:
@@ -189,9 +196,9 @@ the machine toward or away from this, including the cost vigil itself adds.
 
 ## The live incident-monitoring loop
 
-- `vigil watch` runs continuously in the background; an alert firing notifies with the
-  exact command to investigate it — `vigil investigate <alert-key>` — but does not
-  itself spawn an agent. Only alert keys `agent::is_journal_worthy` returns true for
+- `vigil watch` runs continuously in the background; an alert firing notifies but
+  never spawns an agent, and `vigil investigate <alert-key>` stays the user's own
+  call. Only alert keys `agent::is_journal_worthy` returns true for
   (`high_load`, `cpu_hog:*`, `battery_low`, `high_process_count:*`) also get a stub
   incident file (`incidents::write_stub` — title, alert key, rule message, plus a
   `**Command:**` line when one was captured); other keys fire a plain notification
@@ -206,9 +213,14 @@ the machine toward or away from this, including the cost vigil itself adds.
   in `vigil ui` is deliberately NOT journaled — on-screen only, by design.
 - `vigil-ui` — not `vigil watch`/`vigil ui` — is what actually posts the
   notification for journal-worthy alerts now: it polls the incidents directory
-  itself and posts a real, clickable macOS notification that opens the diagnosis
-  window directly, so it needs to be running (as a `LaunchAgent`, per its README
-  section) for those alerts to notify at all; see
+  itself, silently pre-navigates its (hidden by default) window to the new
+  incident, and then posts a real, clickable macOS notification, so it needs to be
+  running (as a `LaunchAgent`, per its README section) for those alerts to notify
+  at all. The pre-navigation renders only what's already on disk — no agent runs
+  until the user brings that window forward or clicks "Investigate now" (see the
+  opt-in bullet under "Core architectural rule"). Closing the window hides it
+  instead of quitting, since the poller lives in that same process; stop it with
+  `launchctl unload`. See
   `docs/superpowers/specs/2026-08-12-investigate-ui-design.md` for the full design.
 - `vigil incidents` reads that journal from a plain shell (list recent, or `--show
   <name>` for one in full) — this exists specifically because a push notification

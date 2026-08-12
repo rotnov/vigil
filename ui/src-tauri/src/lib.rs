@@ -17,22 +17,120 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-#[tauri::command]
+/// How long `vigil investigate` may run before `vigil-ui` gives up and
+/// kills it. It shells out to a real Claude Agent SDK session, so a
+/// seconds-scale bound would fire on perfectly healthy runs; the main crate
+/// has no wall-clock convention to match (its only bound on an agent
+/// session is `agent/src/vigil_agent/diagnose.py`'s `MAX_INVESTIGATION_TURNS
+/// = 15`), so this is picked to sit comfortably above any investigation
+/// this project has actually observed while still being bounded — the
+/// design spec requires an explicit error state instead of an indefinite
+/// spinner when a spawn "hangs past a reasonable timeout".
+const INVESTIGATE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Same reasoning as `INVESTIGATE_TIMEOUT`, with a longer budget: `vigil
+/// fix` runs the same kind of agent session (`MAX_EXECUTION_TURNS = 10`)
+/// *plus* whatever the approved steps actually do on the machine.
+const FIX_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// How often the wait loop in `run_with_timeout` re-checks a still-running
+/// child. Short enough that the timeout is honored promptly, long enough
+/// that waiting on a 10-minute agent session costs essentially nothing
+/// (vigil's own overhead counts against this project's governing goal).
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Spawns `args`, optionally writes `stdin_text` to the child, and waits up
+/// to `timeout` for it to exit — killing it and returning an error string
+/// if it doesn't. Shared by the two commands that spawn a real agent
+/// session (`investigate`, `run_fix`); the error string flows back through
+/// the same `Result<_, String>` path the frontend already `catch`es, so a
+/// timeout surfaces exactly like a non-zero exit does.
+///
+/// Both pipes are drained on their own threads: a child that fills
+/// stdout's or stderr's buffer blocks until someone reads it, and the
+/// `try_wait` poll loop below never would — the process would sit there
+/// until the timeout killed it, turning a healthy-but-chatty run into a
+/// spurious timeout.
+fn run_with_timeout(args: &[String], stdin_text: Option<&str>, timeout: Duration, what: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to launch {what}: {e}"))?;
+
+    // Write the approvals (when there are any) and *close* the pipe either
+    // way — `take()` moves the handle into this block, so it drops here.
+    // `vigil fix`'s prompt loop reads one line per step and would block
+    // forever on a stdin handle left open; `vigil investigate` reads
+    // nothing but should still see EOF rather than an open pipe.
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Some(text) = stdin_text {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+    }
+
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|mut p| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = p.read_to_end(&mut buf);
+                buf
+            })
+        })
+    }
+    let out_thread = drain(child.stdout.take());
+    let err_thread = drain(child.stderr.take());
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{what} timed out after {}s and was terminated", timeout.as_secs()));
+                }
+                std::thread::sleep(CHILD_POLL_INTERVAL);
+            }
+            Err(e) => return Err(format!("{what} did not exit cleanly: {e}")),
+        }
+    };
+
+    let stdout = out_thread.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = err_thread.and_then(|h| h.join().ok()).unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    } else {
+        let message = String::from_utf8_lossy(&stderr).trim().to_string();
+        // A non-zero exit with nothing on stderr would otherwise render as
+        // an empty error in the window — say *something* instead.
+        Err(if message.is_empty() { format!("{what} exited with {status}") } else { message })
+    }
+}
+
+/// `async` so Tauri runs it off the main thread (a plain `#[tauri::command]`
+/// executes in blocking mode and would freeze the whole app for the length
+/// of an agent session). A non-`async fn` marked this way runs on Tauri's
+/// sync threadpool, which is what the blocking spawn inside wants.
+#[tauri::command(async)]
 fn investigate(alert_key: String, incidents_dir: String) -> Result<(), String> {
     let args = crate::vigil_cli::build_investigate_args(&vigil_bin(), &alert_key, &incidents_dir, agent_dir().as_deref());
-    let output = std::process::Command::new(&args[0])
-        .args(&args[1..])
-        .output()
-        .map_err(|e| format!("failed to launch vigil investigate: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    run_with_timeout(&args, None, INVESTIGATE_TIMEOUT, "vigil investigate").map(|_| ())
 }
 
 #[tauri::command]
 fn read_incident_json(incidents_dir: String, path: String) -> Result<serde_json::Value, String> {
+    // Fast, LLM-free and synchronous, so it stays a blocking command with
+    // no timeout — but it *is* a place a frontend-supplied path first
+    // reaches the real `vigil` CLI, so it re-checks containment (see
+    // `is_allowed_incident_path`).
+    reject_path_outside_incidents_dir(&path)?;
     let args = crate::vigil_cli::build_show_json_args(&vigil_bin(), &incidents_dir, &path);
     let output = std::process::Command::new(&args[0])
         .args(&args[1..])
@@ -47,34 +145,31 @@ fn read_incident_json(incidents_dir: String, path: String) -> Result<serde_json:
 #[tauri::command]
 fn process_tree(alert_key: String) -> Vec<crate::process_tree::ProcessNode> {
     let scope = crate::process_tree::scope_for_alert_key(&alert_key);
-    let mut sys = sysinfo::System::new_all();
+    // `System::new()` rather than `new_all()`: `query_process_tree` refreshes
+    // exactly the process data it needs, and this window never looks at
+    // disks/networks/components, which `new_all()` would scan on every call.
+    let mut sys = sysinfo::System::new();
     crate::process_tree::query_process_tree(&mut sys, &scope)
 }
 
-#[tauri::command]
+/// `async` for the same reason as `investigate` — this one spawns the
+/// execute-agent session, the longest-running thing this app ever waits on.
+#[tauri::command(async)]
 fn run_fix(path: String, approvals: Vec<bool>) -> Result<String, String> {
-    use std::io::Write;
-    use std::process::Stdio;
-
+    reject_path_outside_incidents_dir(&path)?;
     let args = crate::vigil_cli::build_fix_args(&vigil_bin(), &path, agent_dir().as_deref());
-    let mut child = std::process::Command::new(&args[0])
-        .args(&args[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to launch vigil fix: {e}"))?;
-
     let stdin_text = crate::vigil_cli::build_fix_stdin(&approvals);
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(stdin_text.as_bytes());
-    }
+    run_with_timeout(&args, Some(&stdin_text), FIX_TIMEOUT, "vigil fix")
+}
 
-    let output = child.wait_with_output().map_err(|e| format!("vigil fix did not exit cleanly: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// The `Err` form of `is_allowed_incident_path` against the live
+/// `incidents_dir()`, for the two commands that hand a frontend-supplied
+/// path to the real `vigil` CLI.
+fn reject_path_outside_incidents_dir(path: &str) -> Result<(), String> {
+    if is_allowed_incident_path(path, &incidents_dir()) {
+        Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(format!("refusing to act on a path outside the incidents directory: {path}"))
     }
 }
 
@@ -142,6 +237,18 @@ impl WindowReady {
 /// triggered by clicking a menu-bar item or notification, so focusing is
 /// the expected outcome there.
 fn open_incident_window(app: &AppHandle, ready: &WindowReady, path: &str, focus: bool) {
+    // Every path that reaches a window — deep link, single-instance, cold
+    // start, poller — is checked here, one place, before it can become a
+    // `?path=` the frontend then feeds back into `vigil incidents --show`
+    // and possibly `vigil fix`. A registered URL scheme is triggerable by
+    // anything else on the machine, so an unconstrained path would let
+    // arbitrary attacker-chosen markdown render inside vigil's own trusted
+    // window. Logged rather than silently dropped: a legitimate path
+    // failing this check would otherwise be an undebuggable no-op.
+    if !is_allowed_incident_path(path, &incidents_dir()) {
+        eprintln!("[vigil-ui] ignoring incident path outside the incidents directory: {path}");
+        return;
+    }
     // Lock `pending` *before* checking `ready`, rather than checking
     // `ready` first and only locking in the `else` branch -- otherwise
     // there's a race against the `on_page_load` hook's own drain (see
@@ -169,8 +276,25 @@ fn open_incident_window(app: &AppHandle, ready: &WindowReady, path: &str, focus:
     }
 }
 
+/// Pure — the frontend URL for one incident. `auto` carries the same
+/// user-initiated signal `focus` does: `auto=1` means a human just asked
+/// for this window (deep link, menu-bar click routed through
+/// single-instance, cold start by URL), `auto=0` means the poller
+/// pre-navigated silently with nobody looking yet.
+///
+/// `incident.js` gates its `investigate` call on exactly that bit, and this
+/// is the whole reason the parameter exists: without it, the poller's
+/// silent pre-navigation would run a real `vigil investigate` — a real
+/// agent session, real tokens — for every journal-worthy alert with no user
+/// action at all, which contradicts this project's stated opt-in rule
+/// ("Investigation is opt-in, not automatic ... No agent process spawns
+/// until the user explicitly runs that command", AGENTS.md).
+fn incident_url(path: &str, focus: bool) -> String {
+    format!("index.html?path={}&auto={}", urlencoding::encode(path), if focus { "1" } else { "0" })
+}
+
 fn navigate_to_incident(app: &AppHandle, path: &str, focus: bool) {
-    let url = format!("index.html?path={}", urlencoding::encode(path));
+    let url = incident_url(path, focus);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.eval(&format!("window.location.replace('{url}')"));
         let _ = window.show();
@@ -191,6 +315,40 @@ fn navigate_to_incident(app: &AppHandle, path: &str, focus: bool) {
 fn parse_incident_url(url: &str) -> Option<String> {
     let path = url.strip_prefix("vigil://incident/")?;
     urlencoding::decode(path).ok().map(|s| s.into_owned())
+}
+
+/// Pure — is `path` a plausible incident file: a `.md` file lexically
+/// inside `incidents_dir`, with no `..` component anywhere?
+///
+/// Kept separate from `parse_incident_url` (which stays purely about URL
+/// shape) and kept *lexical* rather than filesystem-based on purpose:
+/// - `parse_incident_url` has unit tests that touch no filesystem; folding
+///   a `canonicalize` into it would make them depend on real files
+///   existing, and the check is needed at more call sites than just the
+///   URL one anyway (both Tauri commands take a `path` straight from the
+///   frontend).
+/// - The file may legitimately not exist yet at check time — the poller
+///   can see a stub mid-write — and `canonicalize` fails outright on a
+///   missing path, so it would reject valid incidents.
+/// - Canonicalizing only one side is its own trap on macOS, where
+///   `/tmp` → `/private/tmp` is a symlink: a smoke test run with
+///   `VIGIL_UI_INCIDENTS_DIR=/tmp/...` would compare a resolved path
+///   against an unresolved directory and mysteriously reject everything.
+///
+/// Rejecting any `..` component (rather than resolving them) is what makes
+/// the lexical comparison sound: without `..` there is no way for a path
+/// that starts with `incidents_dir`'s components to escape it. `starts_with`
+/// is component-wise, so a sibling directory sharing a name prefix
+/// (`.../incidents-evil/x.md`) is rejected too.
+fn is_allowed_incident_path(path: &str, incidents_dir: &Path) -> bool {
+    let path = Path::new(path);
+    if path.extension().is_none_or(|ext| ext != "md") {
+        return false;
+    }
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return false;
+    }
+    path.starts_with(incidents_dir)
 }
 
 /// Where the incidents-directory poller (Step 5) looks for new incident
@@ -411,6 +569,28 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             let _ = app.handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // Closing the window must not destroy it: the incidents poller
+            // lives in this same process, so a destroyed last window would
+            // take journal-worthy alert notification down with it (nothing
+            // else posts those anymore -- `vigil watch` stopped in
+            // 51656bd), and `launchd`'s `KeepAlive` would just relaunch a
+            // fresh process in a loop. Hiding instead also preserves
+            // `WindowReady`'s `ready` latch and whatever page is loaded, so
+            // the next incident is a plain `navigate_to_incident` rather
+            // than a re-queue against a window that never loads again.
+            // `on_window_event`'s closure takes `&WindowEvent`, and
+            // `CloseRequestApi::prevent_close` takes `&self` (verified in
+            // tauri-2.11.5/src/app.rs and webview/webview_window.rs).
+            if let Some(window) = app.get_webview_window("main") {
+                let hide_target = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = hide_target.hide();
+                    }
+                });
+            }
+
             // `ready_for_setup` is the same `WindowReady` the
             // `.on_page_load(...)` hook above flips once the "main"
             // webview's first load actually completes -- these paths, and
@@ -439,8 +619,33 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![greet, investigate, read_incident_json, process_tree, run_fix])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // `.build(...)` + `.run(closure)` rather than the plain
+        // `.run(context)`, which installs no `RunEvent` handling at all:
+        // with nothing calling `api.prevent_exit()`, `RunEvent::ExitRequested`
+        // (fired when the last window is destroyed) exits the whole process
+        // -- taking the incidents poller with it. `.build` returns
+        // `crate::Result<App>`, so the `.expect` that used to sit on `.run`
+        // moves here; `App::run` itself returns `()`.
+        //
+        // Only a user-interaction exit is prevented: `ExitRequested`'s
+        // `code` is `None` for those and `Some(_)` for a programmatic
+        // `AppHandle::exit`/`restart`, which stays honored. Verified live
+        // (see this round's smoke run): clicking the window's close button
+        // leaves the process running and a later incident still opens the
+        // window. Whether macOS Cmd-Q routes through this handler at all
+        // was NOT verified; either way the supported way to stop this app
+        // is `launchctl unload ~/Library/LaunchAgents/com.vigil.ui.plist`
+        // (or killing the process) -- deliberate for a background-resident
+        // agent whose whole job is to still be running when an alert fires.
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -474,5 +679,111 @@ mod tests {
     fn parse_incident_url_rejects_a_bare_scheme_with_no_path() {
         assert_eq!(parse_incident_url("vigil://incident/"), Some(String::new()));
         assert_eq!(parse_incident_url("vigil://incident"), None);
+    }
+
+    #[test]
+    fn is_allowed_incident_path_accepts_a_markdown_file_in_the_incidents_dir() {
+        let dir = Path::new("/Users/denis/.vigil/incidents");
+        assert!(is_allowed_incident_path("/Users/denis/.vigil/incidents/2026-08-12-00-00-00-cpu-hog-1.md", dir));
+    }
+
+    #[test]
+    fn is_allowed_incident_path_accepts_a_file_in_this_machine_s_real_incidents_dir() {
+        // The `vigil menubar` -> `vigil://incident/<path>` handoff builds
+        // its path from the main crate's `incidents::default_dir()`
+        // (`$HOME/.vigil/incidents`, absolute), while this crate computes
+        // the same location from `dirs::home_dir()`. If those ever
+        // diverged, the containment check would silently reject every deep
+        // link (an eprintln and a window that never opens), so pin the
+        // shape they have to share.
+        let dir = incidents_dir();
+        assert!(dir.is_absolute(), "incidents_dir() must be absolute, got {dir:?}");
+        let path = dir.join("2026-08-12-00-00-00-cpu-hog-1.md");
+        assert!(is_allowed_incident_path(&path.to_string_lossy(), &dir));
+    }
+
+    #[test]
+    fn is_allowed_incident_path_rejects_traversal_out_of_the_incidents_dir() {
+        let dir = Path::new("/Users/denis/.vigil/incidents");
+        assert!(!is_allowed_incident_path("/Users/denis/.vigil/incidents/../../evil.md", dir));
+        assert!(!is_allowed_incident_path("/Users/denis/.vigil/incidents/../.ssh/known_hosts.md", dir));
+    }
+
+    #[test]
+    fn is_allowed_incident_path_rejects_a_path_outside_the_incidents_dir() {
+        let dir = Path::new("/Users/denis/.vigil/incidents");
+        assert!(!is_allowed_incident_path("/tmp/evil.md", dir));
+        assert!(!is_allowed_incident_path("relative.md", dir));
+    }
+
+    #[test]
+    fn is_allowed_incident_path_rejects_a_sibling_dir_sharing_a_name_prefix() {
+        // The classic string-prefix bug: `starts_with` on `Path` is
+        // component-wise, so this is rejected -- locked in by a test since
+        // a naive `str::starts_with` rewrite would silently accept it.
+        let dir = Path::new("/Users/denis/.vigil/incidents");
+        assert!(!is_allowed_incident_path("/Users/denis/.vigil/incidents-evil/x.md", dir));
+    }
+
+    #[test]
+    fn is_allowed_incident_path_rejects_a_non_markdown_file() {
+        let dir = Path::new("/Users/denis/.vigil/incidents");
+        assert!(!is_allowed_incident_path("/Users/denis/.vigil/incidents/x.sh", dir));
+        assert!(!is_allowed_incident_path("/Users/denis/.vigil/incidents/x", dir));
+    }
+
+    #[test]
+    fn run_with_timeout_returns_a_successful_child_s_stdout() {
+        let args = ["/bin/sh".to_string(), "-c".to_string(), "echo hello".to_string()];
+        assert_eq!(run_with_timeout(&args, None, Duration::from_secs(10), "test"), Ok("hello".to_string()));
+    }
+
+    #[test]
+    fn run_with_timeout_feeds_stdin_and_closes_it() {
+        // The `vigil fix` shape: the child reads its approvals from stdin
+        // and must see EOF afterwards, or it would hang until the timeout.
+        let args = ["/bin/cat".to_string()];
+        assert_eq!(run_with_timeout(&args, Some("y\nN\n"), Duration::from_secs(10), "test"), Ok("y\nN".to_string()));
+    }
+
+    #[test]
+    fn run_with_timeout_reports_a_failing_child_s_stderr() {
+        let args = ["/bin/sh".to_string(), "-c".to_string(), "echo boom >&2; exit 3".to_string()];
+        assert_eq!(run_with_timeout(&args, None, Duration::from_secs(10), "test"), Err("boom".to_string()));
+    }
+
+    #[test]
+    fn run_with_timeout_falls_back_to_the_exit_status_when_stderr_is_empty() {
+        let args = ["/bin/sh".to_string(), "-c".to_string(), "exit 3".to_string()];
+        let err = run_with_timeout(&args, None, Duration::from_secs(10), "test").unwrap_err();
+        assert!(err.starts_with("test exited with"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn run_with_timeout_kills_a_child_that_outlives_its_budget() {
+        let args = ["/bin/sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
+        let started = std::time::Instant::now();
+        let err = run_with_timeout(&args, None, Duration::from_millis(300), "test").unwrap_err();
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "should not have waited for the child to finish");
+    }
+
+    #[test]
+    fn run_with_timeout_reports_a_binary_that_cannot_be_launched() {
+        let args = ["/definitely/not/a/real/binary".to_string()];
+        let err = run_with_timeout(&args, None, Duration::from_secs(10), "test").unwrap_err();
+        assert!(err.starts_with("failed to launch test"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn incident_url_marks_a_user_initiated_arrival_auto_1() {
+        assert_eq!(incident_url("/tmp/incidents/x.md", true), "index.html?path=%2Ftmp%2Fincidents%2Fx.md&auto=1");
+    }
+
+    #[test]
+    fn incident_url_marks_the_pollers_silent_pre_navigation_auto_0() {
+        // The whole point of the parameter: `incident.js` must not run a
+        // real `vigil investigate` for a window nobody has looked at yet.
+        assert_eq!(incident_url("/tmp/incidents/x.md", false), "index.html?path=%2Ftmp%2Fincidents%2Fx.md&auto=0");
     }
 }

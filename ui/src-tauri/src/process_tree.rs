@@ -50,7 +50,9 @@ pub fn scope_for_alert_key(alert_key: &str) -> Scope {
     Scope::None
 }
 
-/// Refreshes `sys` and returns every currently-running process matching
+/// Refreshes `sys` twice, 200ms apart (so per-process CPU is measured over
+/// a real interval rather than a near-zero one — see the comment in the
+/// body), and returns every currently-running process matching
 /// `scope`: for `Scope::Pid`, that one pid plus any process whose parent
 /// chain leads back to it (its direct children — this project's incidents
 /// have not needed grandchildren-of-children trees so far, and going
@@ -58,6 +60,21 @@ pub fn scope_for_alert_key(alert_key: &str) -> Scope {
 /// share an ancestor far up the tree); for `Scope::Name`, every process
 /// whose name matches exactly; for `Scope::None`, an empty list.
 pub fn query_process_tree(sys: &mut System, scope: &Scope) -> Vec<ProcessNode> {
+    // Nothing to scope a tree to -- return before paying for any refresh
+    // at all, let alone the delay below. `Scope::None` is the common case
+    // for `high_load`/`battery_low`/`swap_pressure` incidents, and vigil's
+    // own overhead counts against this project's governing goal.
+    if *scope == Scope::None {
+        return Vec::new();
+    }
+
+    // Two refreshes with a short delay give sysinfo a real CPU delta to
+    // measure -- the same pattern (and the same 200ms) `snapshot.rs::
+    // take_snapshot` on the main crate uses. With a single refresh, every
+    // `cpu_pct` here comes back zeroed or wildly noisy, since there is no
+    // earlier sample to diff against.
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    std::thread::sleep(std::time::Duration::from_millis(200));
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
     match scope {
@@ -119,7 +136,7 @@ mod tests {
 
     #[test]
     fn query_process_tree_is_empty_for_scope_none() {
-        let mut sys = System::new_all();
+        let mut sys = System::new();
         assert_eq!(query_process_tree(&mut sys, &Scope::None), Vec::new());
     }
 
@@ -129,7 +146,7 @@ mod tests {
         // convention as the main vigil crate's own snapshot.rs tests (see
         // AGENTS.md's testing section) -- this process is guaranteed to be
         // running while the test runs.
-        let mut sys = System::new_all();
+        let mut sys = System::new();
         let own_pid = sysinfo::get_current_pid().expect("must be able to read our own pid");
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let own_name = sys.process(own_pid).expect("our own process must be visible to sysinfo").name().to_string_lossy().to_string();
@@ -140,15 +157,37 @@ mod tests {
 
     #[test]
     fn query_process_tree_by_pid_includes_the_target_pid_itself() {
-        let mut sys = System::new_all();
+        let mut sys = System::new();
         let own_pid = sysinfo::get_current_pid().expect("must be able to read our own pid");
         let nodes = query_process_tree(&mut sys, &Scope::Pid(own_pid.as_u32()));
         assert!(nodes.iter().any(|n| n.pid == own_pid.as_u32()));
     }
 
     #[test]
+    fn query_process_tree_samples_cpu_over_a_real_interval() {
+        // The regression guard for the near-zero-interval bug: with only
+        // one refresh, sysinfo has no earlier sample to diff against and
+        // every `cpu_pct` comes back zeroed or noise. Elapsed time is the
+        // stable observable proxy for "there really were two samples" --
+        // asserting on an actual CPU value would be flaky on an idle
+        // machine.
+        let mut sys = System::new();
+        let start = std::time::Instant::now();
+        let _ = query_process_tree(&mut sys, &Scope::Name("definitely-not-a-real-process-name-xyz".to_string()));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(200), "expected two refreshes 200ms apart");
+    }
+
+    #[test]
+    fn query_process_tree_skips_the_sampling_delay_for_scope_none() {
+        let mut sys = System::new();
+        let start = std::time::Instant::now();
+        assert_eq!(query_process_tree(&mut sys, &Scope::None), Vec::new());
+        assert!(start.elapsed() < std::time::Duration::from_millis(200), "Scope::None must not pay for the CPU-sampling delay");
+    }
+
+    #[test]
     fn query_process_tree_by_unmatched_name_is_empty() {
-        let mut sys = System::new_all();
+        let mut sys = System::new();
         let nodes = query_process_tree(&mut sys, &Scope::Name("definitely-not-a-real-process-name-xyz".to_string()));
         assert_eq!(nodes, Vec::new());
     }

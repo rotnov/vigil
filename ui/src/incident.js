@@ -14,13 +14,34 @@ function getIncidentPath() {
   return params.get("path");
 }
 
+// Whether this page load was something a human actually asked for.
+// `navigate_to_incident` (src-tauri/src/lib.rs) sets `auto=1` for every
+// user-initiated arrival -- a `vigil://` deep link, a menu-bar dropdown
+// click routed through single-instance, a cold start launched by URL --
+// and `auto=0` for the incidents poller's silent pre-navigation, which
+// happens with nobody looking. Investigation spends real agent tokens, so
+// only `auto=1` may start one on its own; anything else (including a
+// hand-built URL with no `auto` at all) defers until the user is
+// demonstrably here. See AGENTS.md: "Investigation is opt-in, not
+// automatic ... No agent process spawns until the user explicitly runs
+// that command."
+function isUserInitiated() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("auto") === "1";
+}
+
 function getIncidentsDir(path) {
   // The incidents directory is the path's parent directory.
   const idx = path.lastIndexOf("/");
   return idx === -1 ? "." : path.slice(0, idx);
 }
 
-async function loadIncident(path) {
+function basename(path) {
+  const idx = path.lastIndexOf("/");
+  return idx === -1 ? path : path.slice(idx + 1);
+}
+
+async function loadIncident(path, userInitiated) {
   const incidentsDir = getIncidentsDir(path);
   let incident;
   try {
@@ -30,22 +51,161 @@ async function loadIncident(path) {
     return;
   }
 
-  if (!incident.diagnosis) {
-    setThinking(true);
-    try {
-      await invoke("investigate", { alertKey: incident.alert_key, incidentsDir });
-      incident = await invoke("read_incident_json", { incidentsDir, path });
-    } catch (err) {
-      showError(`Investigation failed: ${err}`);
-      setThinking(false);
-      return;
-    }
-    setThinking(false);
+  if (incident.diagnosis) {
+    await render(incident, path);
+    return;
   }
 
+  if (userInitiated) {
+    const updated = await runInvestigation(incident, incidentsDir, path);
+    if (updated) await render(updated, path);
+    return;
+  }
+
+  // Poller pre-navigation: the window's content is prepared ahead of the
+  // notification (macOS notifications can't carry a click payload), but
+  // nobody has looked at it yet. Render everything that costs nothing,
+  // and wait for real user attention before spending tokens. The triggers
+  // are armed *before* the process-tree query is awaited, so a click or
+  // focus landing during that few-hundred-millisecond query isn't lost.
   renderOrigin(incident);
   renderDiagnosis(incident);
+  setDiagnosisText("New incident — nothing has been investigated yet. Bring this window forward, or start it here:");
+  showInvestigateButton();
+  armDeferredInvestigation(async () => {
+    const updated = await runInvestigation(incident, incidentsDir, path);
+    if (updated) await render(updated, path);
+  });
+  await renderTree(incident);
+}
 
+// The single place an investigation is actually started -- both the
+// immediate (user-initiated arrival) and deferred (poller arrival, user
+// showed up later) paths call this rather than duplicating the
+// invoke/re-read/error handling. Returns the re-read incident on success,
+// or `null` when it already reported the failure itself.
+async function runInvestigation(incident, incidentsDir, path) {
+  hideInvestigateButton();
+  setThinking(true);
+  let updated;
+  try {
+    await invoke("investigate", { alertKey: incident.alert_key, incidentsDir });
+    updated = await invoke("read_incident_json", { incidentsDir, path });
+  } catch (err) {
+    setThinking(false);
+    showError(`Investigation failed: ${err}`);
+    return null;
+  }
+  setThinking(false);
+
+  if (!updated.diagnosis) {
+    // `vigil investigate` takes an *alert key*, but this window is
+    // addressed by *file path*, and the key resolves to whichever
+    // incident file with that key was modified most recently. For a
+    // repeated key (`high_load`, `high_process_count:<name>`, or
+    // `cpu_hog:<pid>` after pid reuse) that can be a different, newer
+    // file than the one on screen -- in which case the re-read above
+    // finds no diagnosis. Say so explicitly instead of falling through
+    // to `renderDiagnosis`'s generic "No diagnosis yet.", which would
+    // look identical to never having investigated at all despite having
+    // just spent real tokens.
+    showError(
+      `The investigation finished but ${basename(path)} still has no diagnosis. ` +
+        `\`vigil investigate\` targets an alert key (${incident.alert_key}), not a file, so it may have written its answer to a more recent incident with the same key. ` +
+        `Check \`vigil incidents\` for the latest one.`
+    );
+    return null;
+  }
+  return updated;
+}
+
+// One-shot triggers for "the user is actually here now". Two kinds:
+//
+//  1. The "Investigate now" button. A click is unambiguous user action and
+//     cannot misfire; it's also the only trigger verifiable without a real
+//     user at a real display, so the waiting state always offers it.
+//  2. The window being brought forward -- but only a focus the *user*
+//     caused. `navigate_to_incident` calls `window.show()` for the poller
+//     too, and this task's smoke run showed that a just-shown window can
+//     come up focused on its own when the app happens to be active,
+//     firing an investigation with nobody involved (exactly the bug this
+//     whole gate exists to prevent, re-entering through the back door).
+//     So a window that already has focus when this arms doesn't count:
+//     it only counts once focus has been lost and the user comes back.
+//
+// Whichever fires first wins; every other listener is torn down so a later
+// focus can't start a second agent session on top of the first.
+function armDeferredInvestigation(start) {
+  let fired = false;
+  let unlistenTauriFocus = null;
+  // False while the window holds a focus it was handed by `show()` rather
+  // than by the user; flipped true the moment that focus is lost.
+  let focusCounts = !document.hasFocus();
+  const button = document.getElementById("investigate-now");
+  const listeners = [];
+
+  const run = () => {
+    if (fired) return;
+    fired = true;
+    for (const [target, event, handler] of listeners) {
+      target.removeEventListener(event, handler);
+    }
+    if (unlistenTauriFocus) {
+      unlistenTauriFocus();
+      unlistenTauriFocus = null;
+    }
+    start();
+  };
+
+  const onFocus = () => {
+    if (focusCounts) run();
+  };
+
+  const on = (target, event, handler) => {
+    target.addEventListener(event, handler);
+    listeners.push([target, event, handler]);
+  };
+
+  on(button, "click", run);
+  on(window, "blur", () => {
+    focusCounts = true;
+  });
+  on(window, "focus", onFocus);
+  on(document, "visibilitychange", () => {
+    if (document.visibilityState === "visible") onFocus();
+  });
+
+  // Tauri's own window-focus event, as a belt to the DOM `focus` event's
+  // braces: `tauri://focus` is a real emitted window event (verified in
+  // tauri-2.11.5/src/manager/window.rs) and `listen` is permitted by this
+  // app's `core:default` capability (which includes `core:event:default`).
+  const listen = window.__TAURI__?.event?.listen;
+  if (listen) {
+    listen("tauri://blur", () => {
+      focusCounts = true;
+    }).catch(() => {});
+    listen("tauri://focus", onFocus)
+      .then((unlisten) => {
+        if (fired) unlisten();
+        else unlistenTauriFocus = unlisten;
+      })
+      .catch(() => {});
+  }
+}
+
+// Renders a fully-diagnosed incident: origin, diagnosis, live process
+// tree, and the proposed-fix card when there is one.
+async function render(incident, path) {
+  renderOrigin(incident);
+  renderDiagnosis(incident);
+  hideInvestigateButton();
+  await renderTree(incident);
+  if (incident.proposed_fix) {
+    renderFixCard(incident.proposed_fix, path);
+  }
+}
+
+async function renderTree(incident) {
   if (incident.alert_key) {
     try {
       const tree = await invoke("process_tree", { alertKey: incident.alert_key });
@@ -66,20 +226,29 @@ async function loadIncident(path) {
   } else {
     document.getElementById("process-tree-card").style.display = "none";
   }
+}
 
-  if (incident.proposed_fix) {
-    renderFixCard(incident.proposed_fix, path);
-  }
+function showInvestigateButton() {
+  document.getElementById("investigate-now-wrap").style.display = "";
+}
+
+function hideInvestigateButton() {
+  document.getElementById("investigate-now-wrap").style.display = "none";
+}
+
+// The diagnosis card's body is this page's one status surface: the
+// diagnosis itself, the "investigating…" placeholder, the deferred-start
+// note, and any error all land here.
+function setDiagnosisText(message) {
+  document.getElementById("diagnosis-body").textContent = message;
 }
 
 function setThinking(isThinking) {
-  document.getElementById("diagnosis-body").textContent = isThinking
-    ? "Investigating…"
-    : "";
+  setDiagnosisText(isThinking ? "Investigating…" : "");
 }
 
 function showError(message) {
-  document.getElementById("diagnosis-body").textContent = message;
+  setDiagnosisText(message);
 }
 
 // Fills in the "what notification led here" inset. The four Tauri commands
@@ -135,7 +304,7 @@ function renderProcessTree(nodes) {
     row.className = "row";
     const statusChip = node.is_zombie ? '<span class="chip leak">zombie</span>' : node.ppid === null ? '<span class="chip idle">orphan</span>' : '<span class="chip idle">child</span>';
     row.innerHTML = `
-      <div class="proc-cell"><span class="proc-name-sm mono">${escapeHtml(node.name)}</span></div>
+      <div class="proc-cell"><span class="proc-name-sm mono">${escapeHtml(node.name)}</span><span class="pid mono">${node.pid}</span></div>
       <span class="parent mono">${node.ppid ?? "—"}</span>
       <span>${statusChip}</span>
       <span class="age mono">${formatDuration(node.run_time_secs)}</span>
@@ -227,7 +396,7 @@ function formatBytes(bytes) {
 window.addEventListener("DOMContentLoaded", () => {
   const path = getIncidentPath();
   if (path) {
-    loadIncident(path);
+    loadIncident(path, isUserInitiated());
   } else {
     showError("No incident path provided.");
   }
