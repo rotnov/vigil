@@ -76,13 +76,11 @@ pub fn run(opts: UiOptions) -> io::Result<()> {
                                 alert_message: &alert.message,
                                 command: alert.command.as_deref(),
                             };
-                            match crate::incidents::write_stub(incidents_dir, &stub) {
-                                // vigil ui's own snapshot loop doesn't write a persistent JSONL log
-                                Ok(_) => crate::alerts::notify(&crate::agent::augment_with_investigate_hint(&alert, None)),
-                                Err(e) => {
-                                    app.push_alert(format!("[vigil] failed to write incident stub: {e}"));
-                                    crate::alerts::notify(&alert);
-                                }
+                            // Same reasoning as watch.rs: vigil-ui owns
+                            // notifying journal-worthy alerts now.
+                            if let Err(e) = crate::incidents::write_stub(incidents_dir, &stub) {
+                                app.push_alert(format!("[vigil] failed to write incident stub: {e}"));
+                                crate::alerts::notify(&alert);
                             }
                         } else {
                             crate::alerts::notify(&alert);
