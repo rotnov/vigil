@@ -81,6 +81,9 @@ pub enum Commands {
         /// Max incidents to list, most recent first (ignored with --show)
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Print `--show`'s match as structured JSON instead of raw markdown
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Investigate an alert: runs the read-only diagnosis agent against
     /// the incident it fired, appending a `## Agent diagnosis` section
@@ -155,5 +158,14 @@ mod tests {
     fn fix_parses_the_incident_file_positional_argument() {
         let cli = Cli::try_parse_from(["vigil", "fix", "/tmp/some-incident.md"]).unwrap();
         assert!(matches!(&cli.command, Commands::Fix { incident_file, .. } if incident_file == "/tmp/some-incident.md"));
+    }
+
+    #[test]
+    fn incidents_json_flag_defaults_to_false_and_can_be_set() {
+        let cli = Cli::try_parse_from(["vigil", "incidents"]).unwrap();
+        assert!(matches!(&cli.command, Commands::Incidents { json: false, .. }));
+
+        let cli = Cli::try_parse_from(["vigil", "incidents", "--json"]).unwrap();
+        assert!(matches!(&cli.command, Commands::Incidents { json: true, .. }));
     }
 }
