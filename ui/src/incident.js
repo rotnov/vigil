@@ -96,6 +96,11 @@ async function runInvestigation(incident, incidentsDir, path) {
   } catch (err) {
     setThinking(false);
     showError(`Investigation failed: ${err}`);
+    // Give the user a way to retry instead of leaving a dead end -- once
+    // `armDeferredInvestigation`'s triggers fire, they're torn down for
+    // good (one-shot by design), so without this the only recovery from a
+    // failed investigation is closing and reopening the window.
+    showInvestigateButton();
     return null;
   }
   setThinking(false);
@@ -116,6 +121,7 @@ async function runInvestigation(incident, incidentsDir, path) {
         `\`vigil investigate\` targets an alert key (${incident.alert_key}), not a file, so it may have written its answer to a more recent incident with the same key. ` +
         `Check \`vigil incidents\` for the latest one.`
     );
+    showInvestigateButton();
     return null;
   }
   return updated;
@@ -196,8 +202,15 @@ function armDeferredInvestigation(start) {
 }
 
 // Renders a fully-diagnosed incident: origin, diagnosis, live process
-// tree, and the proposed-fix card when there is one.
+// tree, and the proposed-fix card when there is one. Reached three ways --
+// arrived with a diagnosis already present, a user-initiated arrival that
+// just investigated, or a deferred (poller) arrival that just investigated
+// via `armDeferredInvestigation` -- and in every one of them the
+// investigation is already done, so the origin note settles on one fixed
+// statement rather than whichever arrival-path text `loadIncident` set
+// earlier (which would otherwise keep describing a state that's over).
 async function render(incident, path) {
+  setOriginNote("This incident has been investigated — see the diagnosis below.");
   renderOrigin(incident);
   renderDiagnosis(incident);
   hideInvestigateButton();
