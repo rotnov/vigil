@@ -34,9 +34,6 @@ pub fn run(args: WatchArgs) {
         .append(true)
         .open(&args.out)
         .expect("failed to open output file");
-    // Absolute so the agent (a separate `uv run` subprocess) can
-    // reliably find it regardless of `--out` being relative.
-    let watch_log_path = std::fs::canonicalize(&args.out).ok().map(|p| p.to_string_lossy().to_string());
 
     let cpu_count = sys.cpus().len();
     let mut alert_state = crate::alerts::AlertState::new();
@@ -87,14 +84,17 @@ pub fn run(args: WatchArgs) {
                             alert_message: &alert.message,
                             command: alert.command.as_deref(),
                         };
-                        match crate::incidents::write_stub(incidents_dir, &stub) {
-                            Ok(_) => {
-                                crate::alerts::notify(&crate::agent::augment_with_investigate_hint(&alert, watch_log_path.as_deref()));
-                            }
-                            Err(e) => {
-                                eprintln!("[vigil] failed to write incident stub: {e}");
-                                crate::alerts::notify(&alert);
-                            }
+                        // No notification here on success: `vigil-ui` polls
+                        // this directory and owns notifying for
+                        // journal-worthy alerts, with a real clickable
+                        // notification watch.rs can't produce on its own
+                        // (see docs/superpowers/specs/2026-08-12-investigate-ui-design.md).
+                        // On a write failure there's no stub for vigil-ui to
+                        // find, so fall back to a plain notification rather
+                        // than going silent.
+                        if let Err(e) = crate::incidents::write_stub(incidents_dir, &stub) {
+                            eprintln!("[vigil] failed to write incident stub: {e}");
+                            crate::alerts::notify(&alert);
                         }
                     } else {
                         crate::alerts::notify(&alert);

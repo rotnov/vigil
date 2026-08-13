@@ -67,13 +67,19 @@ Nothing runs automatically when an alert fires. For `high_load`, `cpu_hog:*`,
 `battery_low`, and `high_process_count:*`, vigil writes a stub incident file
 (title, alert key, rule message, and — for process-specific alerts that captured
 one — a `**Command:**` line with the process's command line at fire time) to
-`~/.vigil/incidents/<date>-<time>-<slug>.md` (override with `--incidents-dir`) and
-notifies with the command to investigate it. Other alert keys (low disk, connection
-counts, swap/memory pressure) just fire a plain notification, same as before this
-feature — no stub file, no investigate hint, nothing added to the journal:
+`~/.vigil/incidents/<date>-<time>-<slug>.md` (override with `--incidents-dir`), and
+`vigil-ui` notifies about it (title `vigil`, body = the rule message). Other alert
+keys (low disk, connection counts, swap/memory pressure) just fire a plain
+notification from `vigil watch` itself, same as before this feature — no stub file,
+nothing added to the journal.
+
+`vigil-ui` pre-loads its window with the new incident before posting that
+notification (macOS notifications can't carry a click payload, so the content has
+to be ready in advance), but it does *not* investigate: the agent only runs once
+you actually bring that window forward or click its "Investigate now" button. From
+a terminal, the same investigation is one command:
 
 ```bash
-# after a notification like "cpu_hog:37489 — investigate? vigil investigate cpu_hog:37489"
 ./target/release/vigil investigate cpu_hog:37489
 ```
 
@@ -181,6 +187,26 @@ Requires an installed and logged-in [Claude Code](https://claude.com/claude-code
 ./target/release/vigil menubar
 ```
 
+### Running `vigil-ui` persistently
+
+`vigil-ui` (the Tauri companion app described under Architecture below) needs
+to be running for journal-worthy alert notifications to appear at all (see
+[docs/superpowers/specs/2026-08-12-investigate-ui-design.md](docs/superpowers/specs/2026-08-12-investigate-ui-design.md)) —
+install it as a LaunchAgent so it survives reboots:
+
+```bash
+cp ui/com.vigil.ui.plist ~/Library/LaunchAgents/com.vigil.ui.plist
+launchctl load ~/Library/LaunchAgents/com.vigil.ui.plist
+```
+
+`vigil-ui`'s "investigate"/"fix" actions require `VIGIL_BIN`/`VIGIL_AGENT_DIR`
+to be set correctly in the plist for wherever `vigil` is actually checked out
+and built on the machine running it — the committed plist bakes in this
+maintainer's own checkout path as a default, so a reader deploying it
+themselves needs to adjust both paths to their own checkout location.
+
+To stop it: `launchctl unload ~/Library/LaunchAgents/com.vigil.ui.plist`.
+
 ## Tests
 
 ```bash
@@ -261,6 +287,27 @@ vigil (Rust)                            agent/ (Python, Claude Agent SDK)
 └── main.rs — Cli::parse() + dispatch
     to the module owning each subcommand
 ```
+
+A third top-level project, `ui/` (Tauri: a Rust backend plus a vanilla TS/HTML/CSS
+webview — a standard Tauri layout, not diagrammed file-by-file above since any
+Tauri-familiar reader already knows the shape), builds `vigil-ui`: a background-
+resident macOS companion app (no Dock icon, no tray icon of its own — `vigil
+menubar`'s is enough) that turns a journal-worthy incident into a glanceable
+window instead of a markdown file. Two things trigger it: `vigil menubar`'s
+dropdown click hands off an incident's path instead of opening the raw file, and
+`vigil-ui`'s own poller of `~/.vigil/incidents/` posts a real, clickable macOS
+notification for new journal-worthy stubs (see "The live incident-monitoring
+loop" in `AGENTS.md`). Either path opens a window with the diagnosis and a live
+process tree, entirely by shelling out to the same `vigil investigate`/`vigil
+fix`/`vigil incidents --show --json` CLI surface a terminal user already has — it
+has no diagnosis or execution logic of its own. The poller path prepares that
+window silently; no agent session starts until you actually look at the window
+(bring it forward) or click "Investigate now", so the opt-in rule holds for the UI
+exactly as it does in the terminal. Closing the window hides it rather than
+quitting — the poller lives in that same process, so quitting would stop
+journal-worthy notifications altogether; stop it with `launchctl unload` instead. See
+[docs/superpowers/specs/2026-08-12-investigate-ui-design.md](docs/superpowers/specs/2026-08-12-investigate-ui-design.md)
+for the full design.
 
 Project-wide design decisions with a real alternative (a parsing strategy, an alert
 heuristic, a new subsystem) are recorded under

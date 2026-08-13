@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vigil.ui</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/vigil-ui.app/Contents/MacOS/vigil-ui</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VIGIL_BIN</key>
+        <string>/Users/denis/projects/vigil/target/release/vigil</string>
+        <key>VIGIL_AGENT_DIR</key>
+        <string>/Users/denis/projects/vigil/agent</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/vigil-ui.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/vigil-ui.log</string>
+</dict>
+</plist>

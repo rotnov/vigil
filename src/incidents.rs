@@ -187,6 +187,58 @@ pub fn extract_command(content: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The text after `**Alert key:**` on its own line, with its surrounding
+/// backticks stripped (the field is written as `` `{key}` ``, see
+/// `write_stub`). `None` if the line is missing or malformed.
+pub fn extract_alert_key(content: &str) -> Option<&str> {
+    content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("**Alert key:**"))
+        .map(str::trim)
+        .and_then(|s| s.strip_prefix('`')?.strip_suffix('`'))
+        .filter(|s| !s.is_empty())
+}
+
+/// The agent's diagnosis text — everything between the `## Agent
+/// diagnosis` heading `append_diagnosis` wrote and whichever comes first of
+/// the `## Proposed fix`/`## Fix execution` headings that may follow it (or
+/// end of file, if neither does). `## Proposed fix` is deliberately treated
+/// as a boundary here even though it's nested *inside* what the agent
+/// wrote, not a heading vigil itself added — the JSON plan under it is
+/// parsed separately by `fixplan::extract_proposed_fix_json`, so excluding
+/// it from the plain-text diagnosis avoids duplicating that JSON block
+/// inside a prose field a UI would otherwise render as plain text.
+pub fn extract_diagnosis(content: &str) -> Option<&str> {
+    let start = content.find("## Agent diagnosis")? + "## Agent diagnosis".len();
+    let rest = &content[start..];
+    let end = ["## Proposed fix", "## Fix execution"]
+        .iter()
+        .filter_map(|h| rest.find(h))
+        .min()
+        .unwrap_or(rest.len());
+    let text = rest[..end].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// The execute-agent's report — everything after the `## Fix execution`
+/// heading `append_fix_execution` wrote, to end of file (it's always the
+/// last section any of `write_stub`/`append_diagnosis`/
+/// `append_fix_execution` ever add, so there's no later heading to stop
+/// at).
+pub fn extract_fix_execution(content: &str) -> Option<&str> {
+    let start = content.find("## Fix execution")? + "## Fix execution".len();
+    let text = content[start..].trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// `alert.key` values can contain `:`/other punctuation (e.g. `cpu_hog:1234`)
 /// that isn't filename-safe — normalize to lowercase hyphen-separated words.
 /// `pub(crate)` (not private) because `investigate.rs` needs the exact same
@@ -493,6 +545,82 @@ mod tests {
     #[test]
     fn extract_command_is_none_when_the_field_is_absent() {
         assert_eq!(extract_command("# t\n\n**Rule message:** m\n"), None);
+    }
+
+    #[test]
+    fn extract_alert_key_strips_backticks() {
+        let content = "# t\n\n**Alert key:** `cpu_hog:1234`\n\n**Rule message:** m\n";
+        assert_eq!(extract_alert_key(content), Some("cpu_hog:1234"));
+    }
+
+    #[test]
+    fn extract_alert_key_is_none_when_the_field_is_absent() {
+        assert_eq!(extract_alert_key("# t\n\n**Rule message:** m\n"), None);
+    }
+
+    #[test]
+    fn extract_alert_key_is_none_when_the_field_is_not_wrapped_in_backticks() {
+        // Malformed/hand-edited stub: no backticks around the key at all,
+        // so `strip_prefix('`')` fails and the `?` inside `and_then` short
+        // -circuits to `None` rather than returning the raw text.
+        let content = "# t\n\n**Alert key:** cpu_hog:1\n\n**Rule message:** m\n";
+        assert_eq!(extract_alert_key(content), None);
+    }
+
+    #[test]
+    fn extract_diagnosis_reads_up_to_end_of_file_when_there_is_no_proposed_fix() {
+        let content = "# t\n\n**Rule message:** m\n\n## Agent diagnosis\n\nThe culprit is pycharm.\n";
+        assert_eq!(extract_diagnosis(content), Some("The culprit is pycharm."));
+    }
+
+    #[test]
+    fn extract_diagnosis_stops_before_a_nested_proposed_fix_heading() {
+        let content = "# t\n\n## Agent diagnosis\n\n## Diagnosis\n\ntext\n\n## Proposed fix\n\n```json\n{}\n```\n";
+        let diagnosis = extract_diagnosis(content).unwrap();
+        assert!(diagnosis.contains("## Diagnosis"));
+        assert!(diagnosis.contains("text"));
+        assert!(!diagnosis.contains("## Proposed fix"));
+    }
+
+    #[test]
+    fn extract_diagnosis_stops_before_a_later_fix_execution_heading() {
+        let content = "# t\n\n## Agent diagnosis\n\ntext\n\n## Fix execution\n\n1. done\n";
+        assert_eq!(extract_diagnosis(content), Some("text"));
+    }
+
+    #[test]
+    fn extract_diagnosis_is_none_when_the_heading_is_absent() {
+        assert_eq!(extract_diagnosis("# t\n\nno diagnosis here\n"), None);
+    }
+
+    #[test]
+    fn extract_diagnosis_is_none_when_the_heading_is_present_but_body_is_empty() {
+        // The heading exists but is immediately followed by the next
+        // section with nothing in between (after trimming) — treated the
+        // same as "no diagnosis yet", not an empty-but-present diagnosis.
+        let content = "# t\n\n## Agent diagnosis\n\n## Proposed fix\n\n```json\n{}\n```\n";
+        assert_eq!(extract_diagnosis(content), None);
+    }
+
+    #[test]
+    fn extract_fix_execution_reads_to_end_of_file() {
+        let content = "# t\n\n## Fix execution\n\n_Approved: 2026-08-09 02:30 (steps 1 of 1)_\n\n1. done\n";
+        let report = extract_fix_execution(content).unwrap();
+        assert!(report.contains("1. done"));
+        assert!(report.starts_with("_Approved:"));
+    }
+
+    #[test]
+    fn extract_fix_execution_is_none_when_the_heading_is_absent() {
+        assert_eq!(extract_fix_execution("# t\n\nno fix execution here\n"), None);
+    }
+
+    #[test]
+    fn extract_fix_execution_is_none_when_the_heading_is_present_but_body_is_empty() {
+        // The heading exists but nothing (or only whitespace) follows it —
+        // e.g. a fix run that produced no journal text.
+        let content = "# t\n\n## Fix execution\n\n";
+        assert_eq!(extract_fix_execution(content), None);
     }
 
     #[test]

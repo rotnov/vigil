@@ -14,6 +14,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 tray-icon = "0.24.2"
 tao = "0.36.0"
+urlencoding = "2"
 
 [profile.release]
 opt-level = "z"
